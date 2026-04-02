@@ -1590,6 +1590,15 @@ wheels = [
 ]
 
 [package.optional-dependencies]
+cli = [
+    { name = "huggingface-hub" },
+    { name = "openai" },
+    { name = "pyyaml" },
+    { name = "rich" },
+    { name = "tomli" },
+    { name = "tomli-w" },
+    { name = "typer" },
+]
 core = [
     { name = "fastapi" },
     { name = "pydantic" },
@@ -1603,7 +1612,7 @@ name = "openenv-dba-tuner-env"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "openenv-core", extra = ["core"] },
+    { name = "openenv-core", extra = ["cli", "core"] },
 ]
 
 [package.optional-dependencies]
@@ -1614,7 +1623,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "openenv-core", extras = ["core"], specifier = ">=0.2.2" },
+    { name = "openenv-core", extras = ["cli", "core"], specifier = ">=0.2.2" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=4.0.0" },
 ]
