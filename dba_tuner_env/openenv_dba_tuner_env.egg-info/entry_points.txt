@@ -1,0 +1,2 @@
+[console_scripts]
+server = dba_tuner_env.server.app:main

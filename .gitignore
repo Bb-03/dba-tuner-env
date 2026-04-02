@@ -1,0 +1,12 @@
+# Environments
+.venv/
+env/
+venv/
+__pycache__/
+
+# Secrets and Local Configs
+.env
+.DS_Store
+
+# OpenEnv / Testing cache
+.pytest_cache/
