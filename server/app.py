@@ -1,11 +1,5 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 """
-FastAPI application for the Dba Tuner Env Environment.
+FastAPI application for the DBA Tuner Env Environment.
 
 This module creates an HTTP server that exposes the DbaTunerEnvironment
 over HTTP and WebSocket endpoints, compatible with EnvClient.
@@ -22,7 +16,7 @@ Usage:
     uvicorn server.app:app --reload --host 0.0.0.0 --port 8000
 
     # Production:
-    uvicorn server.app:app --host 0.0.0.0 --port 8000 --workers 4
+    uvicorn server.app:app --host 0.0.0.0 --port 8000
 
     # Or run directly:
     python -m server.app
@@ -38,7 +32,9 @@ except Exception as e:  # pragma: no cover
 try:
     from ..models import DbaTunerAction, DbaTunerObservation
     from .dba_tuner_env_environment import DbaTunerEnvironment
-except ModuleNotFoundError:
+except (ImportError, SystemError):
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
     from models import DbaTunerAction, DbaTunerObservation
     from server.dba_tuner_env_environment import DbaTunerEnvironment
 
@@ -49,36 +45,16 @@ app = create_app(
     DbaTunerAction,
     DbaTunerObservation,
     env_name="dba_tuner_env",
-    max_concurrent_envs=1,  # increase this number to allow more concurrent WebSocket sessions
+    max_concurrent_envs=4,  # allow concurrent WebSocket sessions
 )
 
 
 def main(host: str = "0.0.0.0", port: int = 8000):
-    """
-    Entry point for direct execution via uv run or python -m.
-
-    This function enables running the server without Docker:
-        uv run --project . server
-        uv run --project . server --port 8001
-        python -m dba_tuner_env.server.app
-
-    Args:
-        host: Host address to bind to (default: "0.0.0.0")
-        port: Port number to listen on (default: 8000)
-
-    For production deployments, consider using uvicorn directly with
-    multiple workers:
-        uvicorn dba_tuner_env.server.app:app --workers 4
-    """
+    """Entry point for direct execution via uv run or python -m."""
     import uvicorn
 
     uvicorn.run(app, host=host, port=port)
 
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, default=8000)
-    args = parser.parse_args()
-    main(port=args.port)
+    main()
