@@ -4,4 +4,19 @@ type: space
 runtime: fastapi
 app: server.app:app
 port: 8000
-
+description: >
+  DBA-Tuner-Env: An AI agent acts as a Database Administrator optimising
+  DuckDB query performance across 7 difficulty levels — from simple index
+  creation to materialised views and N+1 pattern fixes.
+  Features a Pareto-skewed (α=1.1) e-commerce dataset, continuous reward
+  signal, 50 MB storage budget, and 5-second SQL timeout sandbox.
+tags:
+  - DBA
+  - SQL-Optimization
+  - DuckDB
+  - Efficiency
+  - database
+  - performance
+  - rl-environment
+memory: 2GB
+cpus: 2

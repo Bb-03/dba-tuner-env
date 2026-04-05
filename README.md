@@ -1,255 +1,184 @@
 ---
-title: Dba Tuner Env Environment Server
-emoji: 🎧
-colorFrom: blue
-colorTo: gray
+title: DBA Tuner Env — SQL Performance Optimisation Arena
+emoji: 🗄️
+colorFrom: indigo
+colorTo: blue
 sdk: docker
 pinned: false
 app_port: 8000
 base_path: /web
 tags:
   - openenv
+  - database
+  - sql
+  - duckdb
+  - reinforcement-learning
 ---
 
-# Dba Tuner Env Environment
+# DBA Tuner Env 🗄️
 
-A simple test environment that echoes back messages. Perfect for testing the env APIs as well as demonstrating environment usage patterns.
+**An AI agent acts as a Database Administrator (DBA) to optimise DuckDB query
+performance across 7 difficulty levels — from simple index creation to
+materialised views, N+1 pattern fixes, and multi-query budget challenges.**
+
+## Overview
+
+| Attribute | Value |
+|-----------|-------|
+| **Domain** | Database performance, SQL optimisation |
+| **Backend** | DuckDB (in-memory, `:memory:`) |
+| **Dataset** | 100k-row Pareto-skewed (α=1.1) e-commerce data |
+| **Levels** | 7 (Easy → Expert) |
+| **Reward** | Continuous [0.0 → 1.0], multi-faceted |
+| **Hardware** | 8 GB RAM / 2 vCPU |
+
+---
 
 ## Quick Start
 
-The simplest way to use the Dba Tuner Env environment is through the `DbaTunerEnv` class:
-
 ```python
-from dba_tuner_env import DbaTunerAction, DbaTunerEnv
+from server.dba_tuner_env_environment import DbaTunerEnvironment
+from models import DbaTunerAction
 
-try:
-    # Create environment from Docker image
-    dba_tuner_envenv = DbaTunerEnv.from_docker_image("dba_tuner_env-env:latest")
+env = DbaTunerEnvironment()
+obs = env.reset(level=1)          # or omit level for random pick
+print(obs.scenario_description)
 
-    # Reset
-    result = dba_tuner_envenv.reset()
-    print(f"Reset: {result.observation.echoed_message}")
+# Thinking trajectory: explain → get_stats → add_index
+obs = env.step(DbaTunerAction(action_type="explain"))
+print(obs.query_plan)             # EXPLAIN ANALYZE output
 
-    # Send multiple messages
-    messages = ["Hello, World!", "Testing echo", "Final message"]
+obs = env.step(DbaTunerAction(action_type="get_stats", table="orders"))
+print(obs.query_plan)             # column stats with est_index_size
 
-    for msg in messages:
-        result = dba_tuner_envenv.step(DbaTunerAction(message=msg))
-        print(f"Sent: '{msg}'")
-        print(f"  → Echoed: '{result.observation.echoed_message}'")
-        print(f"  → Length: {result.observation.message_length}")
-        print(f"  → Reward: {result.reward}")
+obs = env.step(DbaTunerAction(
+    action_type="add_index", table="orders", column="user_id"
+))
+print(f"Reward: {obs.reward:.4f}   Cost-reduction: {obs.metadata['cost_reduction_ratio']:.2%}")
 
-finally:
-    # Always clean up
-    dba_tuner_envenv.close()
+env.close()
 ```
 
-That's it! The `DbaTunerEnv.from_docker_image()` method handles:
-- Starting the Docker container
-- Waiting for the server to be ready
-- Connecting to the environment
-- Container cleanup when you call `close()`
+---
 
-## Building the Docker Image
+## Database Schema
 
-Before using the environment, you need to build the Docker image:
+```
+users      (100 000 rows)  user_id★, username, email, signup_date, country
+products   ( 10 000 rows)  product_id★, name, category, price, created_at
+orders     (100 000 rows)  order_id, user_id★, order_date, status, total_amount
+line_items (300 000 rows)  line_item_id, order_id, product_id★, quantity, unit_price
+
+★ Pareto-skewed (α=1.1): ~20% of IDs account for ~80% of rows.
+  Run get_stats to identify hot values before choosing which columns to index.
+```
+
+---
+
+## 7-Level Curriculum
+
+| Level | Name | Goal |
+|-------|------|------|
+| 1 | Sequential Scan | Add index on `orders.user_id` |
+| 2 | FK Join Index | Index `line_items.order_id` for Hash→Nested-Loop |
+| 3 | Subquery Refactor | Replace correlated subquery with window function |
+| 4 | Budget Challenge | Optimise 5 queries within 50 MB index limit |
+| 5 | N+1 Fix | Collapse per-row SELECTs into a single batch JOIN |
+| 6 | Range Scan | Index `orders.order_date` for BETWEEN queries |
+| 7 | Materialised View | CREATE TABLE AS → SELECT from it (5-table join) |
+
+---
+
+## Action Space
+
+```json
+{"action_type": "explain"}
+{"action_type": "get_stats",  "table": "orders"}
+{"action_type": "add_index",  "table": "orders",  "column": "user_id"}
+{"action_type": "drop_index", "index_name": "idx_orders_user_id"}
+{"action_type": "rewrite",    "new_sql": "SELECT ..."}
+```
+
+---
+
+## Reward Function
+
+```
+Reward = CostReductionRatio                     # (baseline_latency - current_latency) / baseline
+       + 0.1  (one-time)                        # first explain or get_stats call
+       - 0.02 × index_count                     # over-indexing penalty
+       - 0.005 × storage_used_mb                # storage waste penalty
+       - 0.01 × step_count                      # efficiency penalty
+
+Terminal score (done=True):
+  is_correct=True  → max(0.0, min(1.0, best_step_reward))
+  is_correct=False → 0.0  (wrong results = zero)
+```
+
+Step rewards during an episode may be **negative** (RL signal).
+The final episode score is always in **[0.0, 1.0]**.
+
+---
+
+## Running Locally
 
 ```bash
-# From project root
-docker build -t dba_tuner_env-env:latest -f server/Dockerfile .
+# Install dependencies
+uv sync
+
+# Run the HTTP server
+uvicorn server.app:app --reload --host 0.0.0.0 --port 8000
+
+# Run inference against all 7 tasks
+export HF_TOKEN="hf_..."
+python inference.py
+
+# Direct environment smoke-test (no server needed)
+python server/dba_tuner_env_environment.py
 ```
 
-## Deploying to Hugging Face Spaces
+---
 
-You can easily deploy your OpenEnv environment to Hugging Face Spaces using the `openenv push` command:
+## Inference Log Format
 
-```bash
-# From the environment directory (where openenv.yaml is located)
-openenv push
-
-# Or specify options
-openenv push --namespace my-org --private
+```
+[START] task=simple_index env=dba_tuner_env model=Qwen/Qwen2.5-72B-Instruct
+[STEP]  step=1 action=explain() reward=0.0900 done=false error=null
+[STEP]  step=2 action=get_stats(orders) reward=0.0389 done=false error=null
+[STEP]  step=3 action=add_index(orders,user_id) reward=0.2901 done=false error=null
+[END]   success=true steps=3 score=0.2901 avg_reward=0.1396 rewards=0.0900,0.0389,0.2901
 ```
 
-The `openenv push` command will:
-1. Validate that the directory is an OpenEnv environment (checks for `openenv.yaml`)
-2. Prepare a custom build for Hugging Face Docker space (enables web interface)
-3. Upload to Hugging Face (ensuring you're logged in)
-
-### Prerequisites
-
-- Authenticate with Hugging Face: The command will prompt for login if not already authenticated
-
-### Options
-
-- `--directory`, `-d`: Directory containing the OpenEnv environment (defaults to current directory)
-- `--repo-id`, `-r`: Repository ID in format 'username/repo-name' (defaults to 'username/env-name' from openenv.yaml)
-- `--base-image`, `-b`: Base Docker image to use (overrides Dockerfile FROM)
-- `--private`: Deploy the space as private (default: public)
-
-### Examples
-
-```bash
-# Push to your personal namespace (defaults to username/env-name from openenv.yaml)
-openenv push
-
-# Push to a specific repository
-openenv push --repo-id my-org/my-env
-
-# Push with a custom base image
-openenv push --base-image ghcr.io/meta-pytorch/openenv-base:latest
-
-# Push as a private space
-openenv push --private
-
-# Combine options
-openenv push --repo-id my-org/my-env --base-image custom-base:latest --private
-```
-
-After deployment, your space will be available at:
-`https://huggingface.co/spaces/<repo-id>`
-
-The deployed space includes:
-- **Web Interface** at `/web` - Interactive UI for exploring the environment
-- **API Documentation** at `/docs` - Full OpenAPI/Swagger interface
-- **Health Check** at `/health` - Container health monitoring
-- **WebSocket** at `/ws` - Persistent session endpoint for low-latency interactions
-
-## Environment Details
-
-### Action
-**DbaTunerAction**: Contains a single field
-- `message` (str) - The message to echo back
-
-### Observation
-**DbaTunerObservation**: Contains the echo response and metadata
-- `echoed_message` (str) - The message echoed back
-- `message_length` (int) - Length of the message
-- `reward` (float) - Reward based on message length (length × 0.1)
-- `done` (bool) - Always False for echo environment
-- `metadata` (dict) - Additional info like step count
-
-### Reward
-The reward is calculated as: `message_length × 0.1`
-- "Hi" → reward: 0.2
-- "Hello, World!" → reward: 1.3
-- Empty message → reward: 0.0
-
-## Advanced Usage
-
-### Connecting to an Existing Server
-
-If you already have a Dba Tuner Env environment server running, you can connect directly:
-
-```python
-from dba_tuner_env import DbaTunerEnv
-
-# Connect to existing server
-dba_tuner_envenv = DbaTunerEnv(base_url="<ENV_HTTP_URL_HERE>")
-
-# Use as normal
-result = dba_tuner_envenv.reset()
-result = dba_tuner_envenv.step(DbaTunerAction(message="Hello!"))
-```
-
-Note: When connecting to an existing server, `dba_tuner_envenv.close()` will NOT stop the server.
-
-### Using the Context Manager
-
-The client supports context manager usage for automatic connection management:
-
-```python
-from dba_tuner_env import DbaTunerAction, DbaTunerEnv
-
-# Connect with context manager (auto-connects and closes)
-with DbaTunerEnv(base_url="http://localhost:8000") as env:
-    result = env.reset()
-    print(f"Reset: {result.observation.echoed_message}")
-    # Multiple steps with low latency
-    for msg in ["Hello", "World", "!"]:
-        result = env.step(DbaTunerAction(message=msg))
-        print(f"Echoed: {result.observation.echoed_message}")
-```
-
-The client uses WebSocket connections for:
-- **Lower latency**: No HTTP connection overhead per request
-- **Persistent session**: Server maintains your environment state
-- **Efficient for episodes**: Better for many sequential steps
-
-### Concurrent WebSocket Sessions
-
-The server supports multiple concurrent WebSocket connections. To enable this,
-modify `server/app.py` to use factory mode:
-
-```python
-# In server/app.py - use factory mode for concurrent sessions
-app = create_app(
-    DbaTunerEnvironment,  # Pass class, not instance
-    DbaTunerAction,
-    DbaTunerObservation,
-    max_concurrent_envs=4,  # Allow 4 concurrent sessions
-)
-```
-
-Then multiple clients can connect simultaneously:
-
-```python
-from dba_tuner_env import DbaTunerAction, DbaTunerEnv
-from concurrent.futures import ThreadPoolExecutor
-
-def run_episode(client_id: int):
-    with DbaTunerEnv(base_url="http://localhost:8000") as env:
-        result = env.reset()
-        for i in range(10):
-            result = env.step(DbaTunerAction(message=f"Client {client_id}, step {i}"))
-        return client_id, result.observation.message_length
-
-# Run 4 episodes concurrently
-with ThreadPoolExecutor(max_workers=4) as executor:
-    results = list(executor.map(run_episode, range(4)))
-```
-
-## Development & Testing
-
-### Direct Environment Testing
-
-Test the environment logic directly without starting the HTTP server:
-
-```bash
-# From the server directory
-python3 server/dba_tuner_env_environment.py
-```
-
-This verifies that:
-- Environment resets correctly
-- Step executes actions properly
-- State tracking works
-- Rewards are calculated correctly
-
-### Running Locally
-
-Run the server locally for development:
-
-```bash
-uvicorn server.app:app --reload
-```
+---
 
 ## Project Structure
 
 ```
-dba_tuner_env/
-├── .dockerignore         # Docker build exclusions
-├── __init__.py            # Module exports
-├── README.md              # This file
-├── openenv.yaml           # OpenEnv manifest
-├── pyproject.toml         # Project metadata and dependencies
-├── uv.lock                # Locked dependencies (generated)
-├── client.py              # DbaTunerEnv client
-├── models.py              # Action and Observation models
+dba-tuner-env/
+├── models.py                          # Action + Observation Pydantic models
+├── inference.py                       # LLM inference script (all 7 tasks)
+├── client.py                          # WebSocket client (DbaTunerEnv)
+├── openenv.yaml                       # OpenEnv manifest
+├── pyproject.toml                     # Package metadata
+├── Dockerfile                         # Container build
 └── server/
-    ├── __init__.py        # Server module exports
-    ├── dba_tuner_env_environment.py  # Core environment logic
-    ├── app.py             # FastAPI application (HTTP + WebSocket endpoints)
-    └── Dockerfile         # Container image definition
+    ├── app.py                         # FastAPI server (HTTP + WS)
+    ├── dba_tuner_env_environment.py   # Core environment logic
+    └── requirements.txt               # Server dependencies
 ```
+
+---
+
+## Deployment to Hugging Face Spaces
+
+```bash
+openenv push                          # push to your HF namespace
+openenv push --repo-id org/dba-env   # custom repo
+openenv push --private                # private space
+```
+
+The deployed space exposes:
+- **`/web`** — Interactive UI
+- **`/docs`** — Swagger / OpenAPI
+- **`/health`** — Health check
+- **`/ws`** — WebSocket (persistent sessions)

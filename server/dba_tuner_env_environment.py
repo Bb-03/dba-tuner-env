@@ -2,21 +2,30 @@
 DBA Tuner Environment Implementation.
 
 High-fidelity OpenEnv environment for database performance tuning using DuckDB.
-Features:
-  - 100k-row e-commerce dataset with power-law skewed distributions
-  - 7-level scenario registry (easy → expert)
-  - Correctness checking via SHA-256 result hashing
-  - Storage budget tracking for indexes
-  - 5-second SQL timeout sandboxing
-  - Reward-hacking prevention (read-only agent access)
+
+Key features
+------------
+* 100k-row e-commerce dataset with Pareto (α=1.1) skewed distributions
+  – ~20% of users/products drive ~80% of activity, forcing the agent to use
+    GetStats before blindly adding indexes.
+* 7-level scenario registry (easy → expert).
+* Correctness checking via pandas DataFrame comparison (robust to column aliases).
+* Storage budget tracking (default 50 MB per episode).
+* 5-second SQL timeout to prevent cross-join hangs.
+* One-shot reasoning bonus: +0.1 awarded for the FIRST explain or get_stats call.
+* Early termination when CostReductionRatio > 0.95 (efficiency signal).
+* Duplicate-rewrite detection (whitespace-normalised comparison → done + penalty).
+* Materialized view grader: CREATE TABLE AS is DDL-only (no correctness check);
+  the subsequent SELECT from the created table IS graded against the gold standard.
+* Step rewards are unclamped (may be negative — real RL signal).
+* Terminal reward (done=True) is clamped to [0.0, 1.0] for hackathon scoring.
+  If correctness fails, terminal reward is forced to 0.0.
 """
 
 from __future__ import annotations
 
-import hashlib
-import random
 import re
-import signal
+import random
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -30,22 +39,42 @@ from openenv.core.env_server.types import State
 try:
     from ..models import DbaTunerAction, DbaTunerObservation
 except (ImportError, SystemError):
-    import sys, os
+    import sys
+    import os
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
     from models import DbaTunerAction, DbaTunerObservation
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Scenario definitions
-# ──────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Database schema hint (injected into every scenario description)
+# ──────────────────────────────────────────────────────────────────────────────
+
+_SCHEMA_HINT = (
+    "SCHEMA: "
+    "users(user_id PK, username, email, signup_date, country) 100k rows | "
+    "products(product_id PK, name, category, price, created_at) 10k rows | "
+    "orders(order_id PK, user_id★, order_date, status, total_amount) 100k rows | "
+    "line_items(line_item_id PK, order_id, product_id★, quantity, unit_price) 300k rows. "
+    "★=Pareto-skewed (α=1.1): run get_stats to find hot values. "
+    "Index budget: 50 MB total. Each index ≈ 0.76 MB on orders/line_items. "
+    "Use explain → get_stats → add_index for a +0.1 reasoning bonus."
+)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Scenario registry
+# ──────────────────────────────────────────────────────────────────────────────
 
 SCENARIOS: List[Dict[str, Any]] = [
-    # ── Level 1: Simple index on high-cardinality column ──
+    # ── Level 1: Sequential scan → index on high-cardinality column ───────
     {
         "level": 1,
         "description": (
-            "Level 1 (Easy): A SELECT query filters orders by user_id on a "
-            "non-indexed column. Add an index to speed it up."
+            "Level 1 (Easy) — Sequential Scan Optimisation.\n"
+            "A SELECT filters orders by user_id on a non-indexed column, causing a full "
+            "table scan on 100k rows. Add an index on orders.user_id to enable an "
+            "index seek.\n"
+            + _SCHEMA_HINT
         ),
         "gold_sql": (
             "SELECT order_id, user_id, order_date, status, total_amount "
@@ -58,12 +87,15 @@ SCENARIOS: List[Dict[str, Any]] = [
         "max_steps": 10,
         "storage_budget_mb": 50.0,
     },
-    # ── Level 2: Join optimisation ──
+    # ── Level 2: Missing FK join index → Index Nested-Loop Join ──────────
     {
         "level": 2,
         "description": (
-            "Level 2 (Medium): Join orders and line_items on non-indexed columns. "
-            "The query triggers a slow Hash Join. Add indexes to optimise."
+            "Level 2 (Medium) — Missing Foreign Key Join Index.\n"
+            "A join between orders and line_items on order_id uses a Hash Join because "
+            "there is no index on line_items.order_id. Add an index on the FK column to "
+            "enable an Index Nested-Loop Join.\n"
+            + _SCHEMA_HINT
         ),
         "gold_sql": (
             "SELECT o.order_id, o.user_id, o.total_amount, "
@@ -82,12 +114,15 @@ SCENARIOS: List[Dict[str, Any]] = [
         "max_steps": 15,
         "storage_budget_mb": 50.0,
     },
-    # ── Level 3: Correlated subquery → window function ──
+    # ── Level 3: Correlated subquery → window function / CTE ─────────────
     {
         "level": 3,
         "description": (
-            "Level 3 (Medium): Replace a correlated subquery with a window "
-            "function or CTE to eliminate redundant scans."
+            "Level 3 (Medium) — Correlated Subquery Refactoring.\n"
+            "The initial query uses a correlated subquery that re-scans the orders "
+            "table once per row, causing O(n²) complexity. Rewrite it using a window "
+            "function (SUM OVER PARTITION BY) or a CTE to perform a single-pass scan.\n"
+            + _SCHEMA_HINT
         ),
         "gold_sql": (
             "SELECT user_id, order_id, total_amount, "
@@ -104,15 +139,21 @@ SCENARIOS: List[Dict[str, Any]] = [
         "max_steps": 15,
         "storage_budget_mb": 50.0,
     },
-    # ── Level 4: Budget challenge (5 slow queries) ──
+    # ── Level 4: Budget Challenge (5 queries, 50 MB) ──────────────────────
     {
         "level": 4,
         "description": (
-            "Level 4 (Long-Horizon Hard): The Budget Challenge. You have 5 slow "
-            "queries and a 50 MB index storage limit. Prioritise which indexes "
-            "give the best aggregate ROI across all queries."
+            "Level 4 (Hard — Long Horizon) — The Budget Challenge.\n"
+            "You have 5 slow queries and only 50 MB of index storage. Each index on "
+            "orders or line_items consumes ~0.76 MB. Prioritise which indexes give the "
+            "best aggregate latency reduction across ALL queries — over-indexing wastes "
+            "budget and earns penalty (−0.005 × MB used).\n"
+            "Queries target: orders.user_id, orders.user_id + line_items.order_id, "
+            "line_items.product_id, orders.user_id (GROUP BY), products.product_id + "
+            "line_items.product_id.\n"
+            + _SCHEMA_HINT
         ),
-        "gold_sql": "MULTI_QUERY",  # special sentinel
+        "gold_sql": "MULTI_QUERY",
         "initial_sql": "MULTI_QUERY",
         "multi_queries": [
             "SELECT * FROM orders WHERE user_id = 100",
@@ -135,13 +176,15 @@ SCENARIOS: List[Dict[str, Any]] = [
         "max_steps": 25,
         "storage_budget_mb": 50.0,
     },
-    # ── Level 5: N+1 pattern → batch join ──
+    # ── Level 5: N+1 pattern → single batch JOIN ──────────────────────────
     {
         "level": 5,
         "description": (
-            "Level 5 (Algorithmic Hard): Detect an N+1 query pattern — the "
-            "initial query executes many small SELECTs in a loop. Rewrite it "
-            "into a single batch JOIN query."
+            "Level 5 (Hard — Algorithmic) — N+1 Query Pattern Fix.\n"
+            "The initial pattern issues 10 separate SELECT queries (one per user_id "
+            "in [1..10]), causing 10 round-trips. Rewrite into a single batch JOIN that "
+            "uses WHERE user_id IN (1,2,...,10) to fetch all results in one pass.\n"
+            + _SCHEMA_HINT
         ),
         "gold_sql": (
             "SELECT o.order_id, o.user_id, o.total_amount, "
@@ -151,18 +194,19 @@ SCENARIOS: List[Dict[str, Any]] = [
             "WHERE o.user_id IN (1,2,3,4,5,6,7,8,9,10) "
             "ORDER BY o.order_id, li.line_item_id"
         ),
-        "initial_sql": "N_PLUS_ONE",  # special sentinel
+        "initial_sql": "N_PLUS_ONE",
         "n_plus_one_user_ids": list(range(1, 11)),
         "max_steps": 20,
         "storage_budget_mb": 50.0,
     },
-    # ── Level 6: Range scan optimisation ──
+    # ── Level 6: Range scan on order_date ────────────────────────────────
     {
         "level": 6,
         "description": (
-            "Level 6 (Architectural Hard): Optimise a range scan on order_date. "
-            "Add an index and/or rewrite the query to enable efficient range "
-            "filtering on the timestamp column."
+            "Level 6 (Hard — Architectural) — Range Scan Optimisation.\n"
+            "A BETWEEN range filter on order_date performs a full table scan on 100k "
+            "rows. Add an index on orders.order_date to enable an efficient range seek.\n"
+            + _SCHEMA_HINT
         ),
         "gold_sql": (
             "SELECT order_id, user_id, order_date, total_amount "
@@ -179,13 +223,19 @@ SCENARIOS: List[Dict[str, Any]] = [
         "max_steps": 15,
         "storage_budget_mb": 50.0,
     },
-    # ── Level 7: Materialised view for complex join ──
+    # ── Level 7: Materialised view for 5-table aggregation ───────────────
     {
         "level": 7,
         "description": (
-            "Level 7 (Trade-offs Hard): Create a materialised view (via "
-            "CREATE TABLE AS) for a complex 5-table aggregation, then rewrite "
-            "the query to use it. Includes logic to refresh the view."
+            "Level 7 (Hard — Trade-offs) — Materialised View Implementation.\n"
+            "A complex 5-table aggregation (users ⋈ orders ⋈ line_items ⋈ products) "
+            "is executed repeatedly. Step 1: issue a CREATE TABLE <name> AS SELECT … "
+            "to materialise the result. Step 2: issue a SELECT … FROM <name> … that "
+            "reads from your materialised table — this SELECT is graded against the "
+            "gold standard result set.\n"
+            "Gold query: top-50 users by revenue with order_count, total_items, "
+            "total_revenue, unique_products (status='completed' only).\n"
+            + _SCHEMA_HINT
         ),
         "gold_sql": (
             "SELECT u.user_id, u.username, u.country, "
@@ -221,26 +271,21 @@ SCENARIOS: List[Dict[str, Any]] = [
 ]
 
 
-# ──────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 # Helpers
-# ──────────────────────────────────────────────────────────────────────
-
-def _hash_results(rows: list) -> str:
-    """SHA-256 hash of sorted, stringified query results."""
-    serialised = str(sorted([str(r) for r in rows]))
-    return hashlib.sha256(serialised.encode("utf-8")).hexdigest()
+# ──────────────────────────────────────────────────────────────────────────────
 
 
 def _execute_with_timeout(
     conn: duckdb.DuckDBPyConnection, sql: str, timeout_s: float = 5.0
 ) -> Tuple[list, float]:
-    """Execute SQL with a timeout.  Returns (rows, elapsed_ms).
+    """Execute *sql* with a wall-clock timeout.
 
-    On timeout raises TimeoutError.
+    Returns (rows, elapsed_ms).  Raises TimeoutError on timeout.
     """
     result_container: Dict[str, Any] = {"rows": None, "error": None}
 
-    def _run():
+    def _run() -> None:
         try:
             result_container["rows"] = conn.execute(sql).fetchall()
         except Exception as exc:
@@ -253,14 +298,11 @@ def _execute_with_timeout(
     elapsed_ms = (time.perf_counter() - start) * 1000.0
 
     if t.is_alive():
-        # Try to interrupt duckdb
         try:
             conn.interrupt()
         except Exception:
             pass
-        raise TimeoutError(
-            f"SQL execution exceeded {timeout_s}s timeout"
-        )
+        raise TimeoutError(f"SQL execution exceeded {timeout_s}s timeout")
 
     if result_container["error"] is not None:
         raise result_container["error"]
@@ -268,79 +310,105 @@ def _execute_with_timeout(
     return result_container["rows"] or [], elapsed_ms
 
 
-def _estimate_index_size_mb(conn: duckdb.DuckDBPyConnection, table: str, column: str) -> float:
-    """Estimate the storage cost of an index on table.column.
+def _estimate_index_size_mb(
+    conn: duckdb.DuckDBPyConnection, table: str, column: str
+) -> float:
+    """Estimate the storage cost of an index on *table*.*column*.
 
-    Uses a rough heuristic: 8 bytes per row × num_rows / 1MB,
-    with a minimum of 0.01 MB.
+    Heuristic: 8 bytes × num_rows / 1 MiB, minimum 0.01 MB.
     """
     try:
-        row_count = conn.execute(
-            f"SELECT COUNT(*) FROM {table}"
-        ).fetchone()[0]
+        row_count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         return max(0.01, (row_count * 8) / (1024 * 1024))
     except Exception:
-        return 0.5  # fallback
+        return 0.5  # safe fallback
 
 
 def _parse_explain_cost(explain_text: str) -> float:
-    """Extract a numeric cost from DuckDB EXPLAIN (ANALYZE) output.
-
-    DuckDB doesn't expose a single cost scalar, so we sum up all
-    numeric values on lines matching common cost patterns.  Falls back
-    to hash-based estimate when nothing parseable is found.
-    """
+    """Sum all numeric values from EXPLAIN ANALYZE output as a synthetic cost."""
     total = 0.0
     for line in explain_text.split("\n"):
-        # Look for timing lines  e.g. "│  0.00  │"
-        nums = re.findall(r"(\d+\.\d+)", line)
-        for n in nums:
+        for n in re.findall(r"(\d+\.\d+)", line):
             total += float(n)
     return total if total > 0 else 1.0
 
 
-# ──────────────────────────────────────────────────────────────────────
+def _extract_create_table_name(sql: str) -> Optional[str]:
+    """Return the table name from a CREATE TABLE [IF NOT EXISTS] <name> AS … statement."""
+    m = re.match(
+        r"\s*CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)",
+        sql,
+        re.IGNORECASE,
+    )
+    return m.group(1) if m else None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Environment
-# ──────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+
 
 class DbaTunerEnvironment(Environment):
     """DBA Tuner environment — OpenEnv compliant.
 
-    Uses an in-memory DuckDB database with power-law-skewed e-commerce
-    data to present database performance tuning challenges across 7
-    difficulty levels.
+    Uses an in-memory DuckDB database with Pareto-skewed (α=1.1) e-commerce
+    data to present 7 levels of database performance tuning challenges.
+
+    Reward design
+    -------------
+    * Step rewards are raw / unclamped (may be negative — provides RL signal).
+    * Terminal reward (done=True, is_correct=True):
+          max(0.0, min(1.0, best_reward_seen_this_episode))
+    * Terminal reward (done=True, is_correct=False): forced to 0.0.
+    * One-shot reasoning bonus (+0.1) on the first explain or get_stats call.
+    * Duplicate rewrite detection (whitespace-normalised): done=True, reward=-0.1.
+    * Early success termination when CostReductionRatio > 0.95.
     """
 
     SUPPORTS_CONCURRENT_SESSIONS: bool = True
+
+    # ── Init ─────────────────────────────────────────────────────────────
 
     def __init__(self) -> None:
         super().__init__()
         self._state = State(episode_id=str(uuid4()), step_count=0)
 
-        # DuckDB connections
+        # DuckDB connection
         self._conn: Optional[duckdb.DuckDBPyConnection] = None
 
         # Episode state
         self._scenario: Dict[str, Any] = {}
         self._current_sql: str = ""
         self._gold_sql: str = ""
-        self._baseline_cost: float = 1.0
         self._baseline_latency: float = 1.0
-        self._active_indexes: Dict[str, float] = {}  # name → size_mb
+        self._baseline_cost: float = 1.0
+        self._active_indexes: Dict[str, float] = {}  # idx_name → size_mb
         self._storage_budget_mb: float = 50.0
         self._storage_used_mb: float = 0.0
-        self._has_reasoned: bool = False
         self._max_steps: int = 15
         self._done: bool = False
+        self._last_rewrite_sql: str = ""
 
-        # For Level 4 multi-query tracking
+        # Reward tracking
+        self._best_reward: float = 0.0           # best intra-episode step reward
+        self._cost_reduction_ratio: float = 0.0  # last computed ratio (for metadata)
+        self._episode_failed: bool = False        # True when episode ends due to incorrect SQL
+
+        # Reasoning bonus (one-shot: fires on the first explain or get_stats call)
+        self._reasoning_bonus_paid: bool = False
+
+        # Materialised view grader state
+        self._mv_created: bool = False
+        self._mv_table_name: str = ""
+
+        # Level 4 multi-query state
         self._multi_queries: List[str] = []
         self._multi_baselines: List[float] = []
 
-        # For Level 5 N+1
+        # Level 5 N+1 state
         self._n_plus_one_user_ids: List[int] = []
 
-    # ── reset ────────────────────────────────────────────────────────
+    # ── Reset ─────────────────────────────────────────────────────────────
 
     def reset(
         self,
@@ -349,18 +417,18 @@ class DbaTunerEnvironment(Environment):
         level: Optional[int] = None,
         **kwargs: Any,
     ) -> DbaTunerObservation:
-        """Reset: generate data, pick scenario, measure baseline.
+        """Reset the environment: generate data, pick scenario, measure baseline.
 
         Args:
-            seed: Random seed for reproducibility.
+            seed:       Random seed for reproducibility.
             episode_id: Optional episode identifier.
-            level: Specific scenario level (1-7) to run. If None, picks randomly.
+            level:      Specific scenario level (1–7).  None → random pick.
         """
         if seed is not None:
             random.seed(seed)
             np.random.seed(seed)
 
-        # Close previous connection if any
+        # Close previous connection
         if self._conn is not None:
             try:
                 self._conn.close()
@@ -368,77 +436,77 @@ class DbaTunerEnvironment(Environment):
                 pass
 
         self._conn = duckdb.connect(":memory:")
-        self._conn.execute("PRAGMA memory_limit='4GB'")
+        self._conn.execute("PRAGMA memory_limit='2GB'")
 
-        # Fresh state
+        # Fresh episode state
         eid = episode_id or str(uuid4())
         self._state = State(episode_id=eid, step_count=0)
         self._active_indexes = {}
         self._storage_used_mb = 0.0
-        self._has_reasoned = False
         self._done = False
+        self._last_rewrite_sql = ""
+        self._best_reward = 0.0
+        self._cost_reduction_ratio = 0.0
+        self._episode_failed = False
+        self._reasoning_bonus_paid = False
+        self._mv_created = False
+        self._mv_table_name = ""
 
-        # Generate data
+        # Generate fresh dataset
         self._generate_data()
 
-        # Pick scenario — specific level or random
+        # Pick scenario
         if level is not None and 1 <= level <= len(SCENARIOS):
             self._scenario = SCENARIOS[level - 1]
         else:
             self._scenario = random.choice(SCENARIOS)
+
         self._storage_budget_mb = self._scenario["storage_budget_mb"]
         self._max_steps = self._scenario["max_steps"]
 
-        # Set up SQL targets
-        level = self._scenario["level"]
-        if level == 4:
+        lv = self._scenario["level"]
+
+        if lv == 4:
             self._multi_queries = list(self._scenario["multi_queries"])
             self._gold_sql = "MULTI_QUERY"
             self._current_sql = "MULTI_QUERY"
-            # Measure baseline for each query
             self._multi_baselines = []
             for q in self._multi_queries:
                 _, lat = _execute_with_timeout(self._conn, q)
                 self._multi_baselines.append(lat)
             self._baseline_latency = sum(self._multi_baselines)
             self._baseline_cost = self._baseline_latency
-        elif level == 5:
+
+        elif lv == 5:
             self._n_plus_one_user_ids = self._scenario["n_plus_one_user_ids"]
             self._gold_sql = self._scenario["gold_sql"]
-            self._current_sql = self._scenario["initial_sql"]
-            # Baseline = time to run all N+1 queries
+            self._current_sql = "N_PLUS_ONE"
             total_lat = 0.0
             for uid in self._n_plus_one_user_ids:
-                q = (
-                    f"SELECT o.order_id, o.user_id, o.total_amount, "
-                    f"li.line_item_id, li.product_id, li.quantity, li.unit_price "
-                    f"FROM orders o "
-                    f"JOIN line_items li ON o.order_id = li.order_id "
-                    f"WHERE o.user_id = {uid} "
-                    f"ORDER BY o.order_id, li.line_item_id"
-                )
+                q = self._n_plus_one_query(uid)
                 _, lat = _execute_with_timeout(self._conn, q)
                 total_lat += lat
             self._baseline_latency = total_lat
             self._baseline_cost = total_lat
+
         else:
             self._gold_sql = self._scenario["gold_sql"]
             self._current_sql = self._scenario["initial_sql"]
-            # Measure baseline
             try:
                 _, lat = _execute_with_timeout(self._conn, self._current_sql)
                 self._baseline_latency = lat
-                explain_text = self._conn.execute(
+                explain_rows = self._conn.execute(
                     f"EXPLAIN ANALYZE {self._current_sql}"
                 ).fetchall()
-                explain_str = "\n".join(str(r) for r in explain_text)
-                self._baseline_cost = _parse_explain_cost(explain_str)
+                self._baseline_cost = _parse_explain_cost(
+                    "\n".join(str(r) for r in explain_rows)
+                )
             except Exception:
                 self._baseline_latency = 100.0
                 self._baseline_cost = 100.0
 
         return DbaTunerObservation(
-            query_plan="Environment reset. Use 'explain' action to see the query plan.",
+            query_plan="Environment reset. Use 'explain' to see the query plan, 'get_stats' to analyse table statistics.",
             latency_ms=self._baseline_latency,
             total_cost=self._baseline_cost,
             storage_used_mb=0.0,
@@ -446,39 +514,43 @@ class DbaTunerEnvironment(Environment):
             index_count=0,
             active_indexes=[],
             is_correct=True,
-            current_sql=(
-                self._current_sql
-                if self._current_sql != "N_PLUS_ONE"
-                else f"-- N+1 loop over user_ids: {self._n_plus_one_user_ids}"
-            ),
+            current_sql=self._display_sql(),
             scenario_level=self._scenario["level"],
             scenario_description=self._scenario["description"],
             error_message="",
             done=False,
             reward=0.0,
+            metadata={
+                "step_count": 0,
+                "episode_id": eid,
+                "cost_reduction_ratio": 0.0,
+                "reasoning_bonus_paid": False,
+            },
         )
 
-    # ── step ─────────────────────────────────────────────────────────
+    # ── Step ──────────────────────────────────────────────────────────────
 
     def step(
         self,
-        action: DbaTunerAction,  # type: ignore[override]
+        action: DbaTunerAction,
         timeout_s: Optional[float] = None,
         **kwargs: Any,
     ) -> DbaTunerObservation:
-        """Execute one step in the environment."""
+        """Execute one action in the environment and return a new observation."""
         if self._done:
+            # Return consistent terminal reward: 0.0 for failed episodes, clamped best for success
             return self._make_obs(
-                error_message="Episode is already done. Call reset().",
+                error_message="Episode is already done. Call reset() to start a new episode.",
                 reward=0.0,
                 done=True,
+                is_correct=not self._episode_failed,
             )
 
         self._state.step_count += 1
 
-        # Check max steps
         if self._state.step_count >= self._max_steps:
             self._done = True
+            # Return the best episode reward on max-steps termination
             return self._make_obs(
                 error_message="Max steps reached.",
                 reward=0.0,
@@ -497,148 +569,133 @@ class DbaTunerEnvironment(Environment):
                 return self._handle_rewrite(action.new_sql)
             elif atype == "get_stats":
                 return self._handle_get_stats(action.table)
+            elif atype == "create_materialized_view":
+                return self._handle_rewrite(action.sql or "")
+            elif atype == "done":
+                self._done = True
+                return self._make_obs(
+                    query_plan="Agent explicitly called done.", 
+                    reward=self._best_reward, 
+                    is_correct=not self._episode_failed,
+                    done=True
+                )
             else:
                 return self._make_obs(
-                    error_message=f"Unknown action_type: {atype}",
+                    error_message=f"Unknown action_type: {atype!r}",
                     reward=0.0,
                 )
         except TimeoutError as e:
-            return self._make_obs(
-                error_message=f"Timeout: {e}",
-                reward=0.0,
-            )
+            return self._make_obs(error_message=f"Timeout: {e}", reward=-0.05)
         except Exception as e:
-            return self._make_obs(
-                error_message=f"Error: {e}",
-                reward=0.0,
-            )
+            return self._make_obs(error_message=f"Error: {e}", reward=0.0)
 
-    # ── action handlers ──────────────────────────────────────────────
+    # ── Action handlers ───────────────────────────────────────────────────
 
     def _handle_explain(self) -> DbaTunerObservation:
         """Run EXPLAIN ANALYZE on the current query."""
-        self._has_reasoned = True
+        # One-shot reasoning bonus
+        bonus = 0.0
+        if not self._reasoning_bonus_paid:
+            bonus = 0.1
+            self._reasoning_bonus_paid = True
 
-        level = self._scenario["level"]
-        if level == 4:
-            # Show plans for all multi-queries
+        lv = self._scenario["level"]
+
+        if lv == 4:
             plans = []
             for i, q in enumerate(self._multi_queries):
                 try:
                     rows = self._conn.execute(f"EXPLAIN ANALYZE {q}").fetchall()
-                    plan_text = "\n".join(str(r) for r in rows)
-                    plans.append(f"--- Query {i+1} ---\n{plan_text}")
+                    plans.append(f"--- Query {i+1} ---\n" + "\n".join(str(r) for r in rows))
                 except Exception as e:
                     plans.append(f"--- Query {i+1} --- ERROR: {e}")
-            full_plan = "\n\n".join(plans)
-            return self._make_obs(query_plan=full_plan, reward=0.0)
-        elif level == 5 and self._current_sql == "N_PLUS_ONE":
-            # Show plan for one representative query
+            plan_text = "\n\n".join(plans)
+
+        elif lv == 5 and self._current_sql == "N_PLUS_ONE":
             uid = self._n_plus_one_user_ids[0]
-            q = (
-                f"SELECT o.order_id, o.user_id, o.total_amount, "
-                f"li.line_item_id, li.product_id, li.quantity, li.unit_price "
-                f"FROM orders o "
-                f"JOIN line_items li ON o.order_id = li.order_id "
-                f"WHERE o.user_id = {uid} "
-                f"ORDER BY o.order_id, li.line_item_id"
-            )
-            rows = self._conn.execute(f"EXPLAIN ANALYZE {q}").fetchall()
-            plan_text = "\n".join(str(r) for r in rows)
+            rows = self._conn.execute(
+                f"EXPLAIN ANALYZE {self._n_plus_one_query(uid)}"
+            ).fetchall()
             plan_text = (
-                f"N+1 PATTERN: This query is executed {len(self._n_plus_one_user_ids)} "
-                f"times in a loop, once per user_id.\n"
-                f"Showing plan for user_id={uid}:\n\n{plan_text}"
+                f"N+1 PATTERN: This query runs {len(self._n_plus_one_user_ids)} times in a loop "
+                f"(once per user_id). Plan for user_id={uid}:\n"
+                + "\n".join(str(r) for r in rows)
             )
-            return self._make_obs(query_plan=plan_text, reward=0.0)
+
         else:
             rows = self._conn.execute(
                 f"EXPLAIN ANALYZE {self._current_sql}"
             ).fetchall()
             plan_text = "\n".join(str(r) for r in rows)
-            return self._make_obs(query_plan=plan_text, reward=0.0)
+
+        reward = self._calculate_reward() + bonus
+        return self._make_obs(query_plan=plan_text, reward=reward)
 
     def _handle_add_index(
         self, table: Optional[str], column: Optional[str]
     ) -> DbaTunerObservation:
-        """Add an index on table.column."""
+        """Create an index on *table*.*column*."""
         if not table or not column:
             return self._make_obs(
                 error_message="add_index requires 'table' and 'column' fields.",
                 reward=0.0,
             )
 
-        # Sanitise names
         table = self._sanitise_identifier(table)
         column = self._sanitise_identifier(column)
-
         idx_name = f"idx_{table}_{column}"
+
         if idx_name in self._active_indexes:
             return self._make_obs(
                 error_message=f"Index {idx_name} already exists.",
                 reward=0.0,
             )
 
-        # Estimate size
         size_mb = _estimate_index_size_mb(self._conn, table, column)
         if self._storage_used_mb + size_mb > self._storage_budget_mb:
             return self._make_obs(
                 error_message=(
-                    f"Not enough storage budget. Need {size_mb:.2f} MB, "
-                    f"have {self._storage_budget_mb - self._storage_used_mb:.2f} MB remaining."
+                    f"Storage budget exceeded. Need {size_mb:.2f} MB, "
+                    f"only {self._storage_budget_mb - self._storage_used_mb:.2f} MB remaining."
                 ),
-                reward=0.0,
+                reward=-0.05,
             )
 
-        # Create index
         try:
-            self._conn.execute(
-                f"CREATE INDEX {idx_name} ON {table}({column})"
-            )
+            self._conn.execute(f"CREATE INDEX {idx_name} ON {table}({column})")
         except Exception as e:
             return self._make_obs(
-                error_message=f"Failed to create index: {e}",
-                reward=0.0,
+                error_message=f"Failed to create index: {e}", reward=0.0
             )
 
         self._active_indexes[idx_name] = size_mb
         self._storage_used_mb += size_mb
 
-        # Reasoning bonus
-        bonus = 0.1 if self._has_reasoned else 0.0
-
-        # Measure improvement
-        reward = self._calculate_reward() + bonus
-
+        reward = self._calculate_reward()
         return self._make_obs(
-            query_plan=f"Index {idx_name} created ({size_mb:.2f} MB).",
+            query_plan=f"Index {idx_name} created ({size_mb:.2f} MB used).",
             reward=reward,
         )
 
-    def _handle_drop_index(
-        self, index_name: Optional[str]
-    ) -> DbaTunerObservation:
+    def _handle_drop_index(self, index_name: Optional[str]) -> DbaTunerObservation:
         """Drop a named index."""
         if not index_name:
             return self._make_obs(
-                error_message="drop_index requires 'index_name' field.",
-                reward=0.0,
+                error_message="drop_index requires 'index_name' field.", reward=0.0
             )
 
         index_name = self._sanitise_identifier(index_name)
 
         if index_name not in self._active_indexes:
             return self._make_obs(
-                error_message=f"Index {index_name} does not exist.",
-                reward=0.0,
+                error_message=f"Index {index_name} does not exist.", reward=0.0
             )
 
         try:
             self._conn.execute(f"DROP INDEX {index_name}")
         except Exception as e:
             return self._make_obs(
-                error_message=f"Failed to drop index: {e}",
-                reward=0.0,
+                error_message=f"Failed to drop index: {e}", reward=0.0
             )
 
         freed = self._active_indexes.pop(index_name)
@@ -650,247 +707,296 @@ class DbaTunerEnvironment(Environment):
             reward=reward,
         )
 
-    def _handle_rewrite(
-        self, new_sql: Optional[str]
-    ) -> DbaTunerObservation:
-        """Replace the current SQL with a new query."""
-        if not new_sql:
+    def _handle_rewrite(self, new_sql: Optional[str]) -> DbaTunerObservation:
+        """Replace the current SQL with *new_sql*."""
+        if not new_sql or not new_sql.strip():
             return self._make_obs(
-                error_message="rewrite requires 'new_sql' field.",
-                reward=0.0,
+                error_message="rewrite requires a non-empty 'new_sql' field.", reward=0.0
             )
 
-        # ── Sandbox: block destructive statements ──
+        # ── Duplicate-rewrite detection (whitespace-normalised) ───────────
+        normalised = " ".join(new_sql.split()).upper()
+        normalised_last = " ".join(self._last_rewrite_sql.split()).upper()
+        if normalised == normalised_last and normalised_last:
+            self._done = True
+            self._episode_failed = True
+            return self._make_obs(
+                error_message=(
+                    "Repeated rewrite with identical SQL detected. "
+                    "Episode terminated for efficiency — solve it, don't loop."
+                ),
+                reward=-0.1,
+                is_correct=False,
+                done=True,
+            )
+        self._last_rewrite_sql = new_sql
+
+        # ── Sandbox: block destructive statements ─────────────────────────
         sql_upper = new_sql.strip().upper()
-        forbidden = ["DELETE", "DROP TABLE", "TRUNCATE", "ALTER TABLE", "UPDATE", "INSERT"]
+        forbidden = ["DELETE ", "DROP TABLE", "TRUNCATE", "ALTER TABLE", "UPDATE ", "INSERT "]
         for kw in forbidden:
             if kw in sql_upper and "DROP INDEX" not in sql_upper:
                 self._done = True
                 return self._make_obs(
-                    error_message=f"Forbidden SQL keyword: {kw}. Only SELECT, CREATE INDEX, DROP INDEX, CREATE TABLE AS SELECT are allowed.",
+                    error_message=(
+                        f"Forbidden SQL keyword detected: {kw.strip()}. "
+                        "Only SELECT, CREATE INDEX, DROP INDEX, and CREATE TABLE AS SELECT are allowed."
+                    ),
                     reward=0.0,
                     done=True,
                 )
 
-        level = self._scenario["level"]
+        lv = self._scenario["level"]
 
-        # Allow CREATE TABLE AS (for materialized views in L7)
-        is_create_table_as = sql_upper.startswith("CREATE TABLE") and "AS" in sql_upper
+        # ── Materialised-view DDL path (CREATE TABLE AS) ──────────────────
+        is_create_table_as = (
+            sql_upper.lstrip().startswith("CREATE TABLE")
+            and "AS" in sql_upper
+        )
 
         if is_create_table_as:
-            # Execute the CREATE TABLE AS, then rewrite current to SELECT from it
+            mv_name = _extract_create_table_name(new_sql)
             try:
                 _execute_with_timeout(self._conn, new_sql)
-                # Extract the table name
-                match = re.match(
-                    r"CREATE\s+TABLE\s+(\w+)\s+AS", new_sql, re.IGNORECASE
-                )
-                if match:
-                    mv_name = match.group(1)
-                    self._current_sql = f"SELECT * FROM {mv_name}"
-                else:
-                    self._current_sql = new_sql
             except Exception as e:
                 return self._make_obs(
-                    error_message=f"CREATE TABLE AS failed: {e}",
-                    reward=0.0,
+                    error_message=f"CREATE TABLE AS failed: {e}", reward=0.0
                 )
-        else:
-            self._current_sql = new_sql
 
-        # ── Correctness check ──
+            # Track MV state; do NOT update _current_sql (keep the original SELECT)
+            self._mv_created = True
+            self._mv_table_name = mv_name or ""
+
+            # One-shot reasoning bonus (unlikely they've already triggered it here,
+            # but honour the flag consistently)
+            bonus = 0.0
+            if not self._reasoning_bonus_paid:
+                bonus = 0.1
+                self._reasoning_bonus_paid = True
+
+            # Small positive reward for the DDL step itself
+            ddl_reward = 0.15 + bonus
+            self._best_reward = max(self._best_reward, ddl_reward)
+
+            return self._make_obs(
+                query_plan=(
+                    f"Materialised table '{self._mv_table_name}' created successfully. "
+                    f"Now issue a rewrite with a SELECT query that reads from '{self._mv_table_name}' "
+                    f"— that SELECT will be graded against the gold standard result set."
+                ),
+                reward=ddl_reward,
+                is_correct=True,
+            )
+
+        # ── Normal SELECT / CTE rewrite path ─────────────────────────────
+        self._current_sql = new_sql
+
+        # ── Correctness check ─────────────────────────────────────────────
         is_correct = True
-        if level == 4:
-            # For multi-query, the rewrite targets one of the queries
-            # Agent should specify which query to rewrite (not applicable for multi)
-            # For simplicity, we validate the rewritten SQL against itself
-            is_correct = True  # cannot compare against multi
-        elif level == 5:
-            # Compare batch result vs N+1 result
-            try:
-                batch_rows, batch_lat = _execute_with_timeout(
-                    self._conn, self._current_sql
-                )
-                # Get gold
-                gold_rows, _ = _execute_with_timeout(
-                    self._conn, self._gold_sql
-                )
-                is_correct = _hash_results(batch_rows) == _hash_results(gold_rows)
-            except Exception as e:
-                return self._make_obs(
-                    error_message=f"Rewrite execution failed: {e}",
-                    reward=0.0,
-                    is_correct=False,
-                )
+
+        if lv == 4:
+            # Multi-query level: correctness not checked on rewrite
+            is_correct = True
         else:
             try:
-                agent_rows, _ = _execute_with_timeout(
-                    self._conn, self._current_sql
-                )
-                gold_rows, _ = _execute_with_timeout(
-                    self._conn, self._gold_sql
-                )
-                is_correct = _hash_results(agent_rows) == _hash_results(gold_rows)
+                import pandas as pd  # noqa: PLC0415
+
+                df_agent = self._conn.execute(self._current_sql).df()
+                df_gold = self._conn.execute(self._gold_sql).df()
+
+                if df_agent.shape != df_gold.shape:
+                    is_correct = False
+                else:
+                    # Rename agent columns to gold columns to be alias-tolerant
+                    df_agent.columns = df_gold.columns
+                    sort_cols = list(df_gold.columns)
+                    df_agent = df_agent.sort_values(by=sort_cols).reset_index(drop=True)
+                    df_gold = df_gold.sort_values(by=sort_cols).reset_index(drop=True)
+                    is_correct = df_agent.equals(df_gold)
+
             except Exception as e:
+                self._done = True
+                self._episode_failed = True
                 return self._make_obs(
-                    error_message=f"Correctness check failed: {e}",
+                    error_message=f"Correctness check failed with invalid SQL error: {e}. Episode terminated.",
                     reward=0.0,
                     is_correct=False,
+                    done=True,
                 )
 
         if not is_correct:
             self._done = True
+            self._episode_failed = True
             return self._make_obs(
-                error_message="Query results do not match gold standard. Episode terminated.",
+                error_message=(
+                    "Query results do not match the gold standard. "
+                    "Episode terminated — reward = 0.0."
+                ),
                 reward=0.0,
                 is_correct=False,
                 done=True,
             )
 
-        # Reasoning bonus
-        bonus = 0.1 if self._has_reasoned else 0.0
-        reward = self._calculate_reward() + bonus
-
+        # ── Compute reward ────────────────────────────────────────────────
+        reward = self._calculate_reward()
         return self._make_obs(
             query_plan="Query rewritten successfully.",
             reward=reward,
             is_correct=True,
         )
 
-    def _handle_get_stats(
-        self, table: Optional[str]
-    ) -> DbaTunerObservation:
-        """Return statistics for a table."""
-        self._has_reasoned = True
+    def _handle_get_stats(self, table: Optional[str]) -> DbaTunerObservation:
+        """Return full cardinality / distribution statistics for *table*."""
+        # One-shot reasoning bonus
+        bonus = 0.0
+        if not self._reasoning_bonus_paid:
+            bonus = 0.1
+            self._reasoning_bonus_paid = True
 
         if not table:
             return self._make_obs(
-                error_message="get_stats requires 'table' field.",
-                reward=0.0,
+                error_message="get_stats requires 'table' field.", reward=0.0
             )
 
         table = self._sanitise_identifier(table)
 
         try:
-            # Row count
             count = self._conn.execute(
                 f"SELECT COUNT(*) FROM {table}"
             ).fetchone()[0]
 
-            # Column info
             cols = self._conn.execute(
                 f"PRAGMA table_info('{table}')"
             ).fetchall()
 
-            stats_lines = [
+            lines = [
                 f"=== Table: {table} ===",
-                f"Row count: {count:,}",
-                f"Columns: {len(cols)}",
+                f"Row count : {count:,}",
+                f"Columns   : {len(cols)}",
+                f"Budget    : {self._storage_budget_mb:.0f} MB total  |  "
+                f"{self._storage_budget_mb - self._storage_used_mb:.2f} MB remaining",
                 "",
             ]
 
-            for col_info in cols:
-                col_name = col_info[1]
-                col_type = col_info[2]
+            for ci in cols:
+                col_name = ci[1]
+                col_type = ci[2]
 
-                # Distinct count
                 distinct = self._conn.execute(
                     f"SELECT COUNT(DISTINCT {col_name}) FROM {table}"
                 ).fetchone()[0]
-
-                # Null count
                 nulls = self._conn.execute(
                     f"SELECT COUNT(*) FROM {table} WHERE {col_name} IS NULL"
                 ).fetchone()[0]
+                est_size = _estimate_index_size_mb(self._conn, table, col_name)
 
-                stats_lines.append(
+                lines.append(
                     f"  {col_name} ({col_type}): "
                     f"distinct={distinct:,}, nulls={nulls:,}, "
-                    f"selectivity={distinct/max(count,1):.4f}"
+                    f"selectivity={distinct/max(count,1):.4f}, "
+                    f"est_index_size={est_size:.2f} MB"
                 )
 
-                # Top-5 most frequent values for integer / varchar
-                if distinct < count and distinct > 0:
+                # Top-5 most frequent values (skew detection)
+                if 0 < distinct < count:
                     try:
                         top5 = self._conn.execute(
                             f"SELECT {col_name}, COUNT(*) AS cnt "
                             f"FROM {table} GROUP BY {col_name} "
                             f"ORDER BY cnt DESC LIMIT 5"
                         ).fetchall()
-                        top_str = ", ".join(
-                            f"{r[0]}({r[1]})" for r in top5
-                        )
-                        stats_lines.append(f"    top5: {top_str}")
+                        top_str = ", ".join(f"{r[0]}({r[1]:,})" for r in top5)
+                        lines.append(f"    top-5: {top_str}")
                     except Exception:
                         pass
 
-            stats_text = "\n".join(stats_lines)
-            return self._make_obs(query_plan=stats_text, reward=0.0)
+            stats_text = "\n".join(lines)
+            reward = self._calculate_reward() + bonus
+            return self._make_obs(query_plan=stats_text, reward=reward)
 
         except Exception as e:
             return self._make_obs(
-                error_message=f"Failed to get stats: {e}",
-                reward=0.0,
+                error_message=f"Failed to get stats: {e}", reward=0.0
             )
 
-    # ── reward ───────────────────────────────────────────────────────
+    # ── Reward calculation ────────────────────────────────────────────────
 
     def _calculate_reward(self) -> float:
-        """Reward = CostReductionRatio - penalty.
+        """Compute the raw (unclamped) step reward.
 
-        Clamped to [0.0, 1.0].
+        Formula:
+            CostReductionRatio
+            − 0.02 × index_count
+            − 0.005 × storage_used_mb
+            − 0.01 × step_count
+
+        The ratio is clamped to [0, 1] before penalty subtraction so that an
+        *increase* in cost does not produce a strongly negative base.
+        Penalties may still push the final value negative — this is intentional
+        RL signal.  Terminal clamping to [0.0, 1.0] is applied in _make_obs.
         """
-        level = self._scenario["level"]
+        lv = self._scenario["level"]
+        self._cost_reduction_ratio = 0.0
 
-        # Measure current cost
         try:
-            if level == 4:
-                current_total = 0.0
-                for q in self._multi_queries:
-                    _, lat = _execute_with_timeout(self._conn, q)
-                    current_total += lat
-                cost_reduction = 1.0 - (current_total / max(self._baseline_latency, 0.001))
-            elif level == 5 and self._current_sql == "N_PLUS_ONE":
-                # Still in N+1 mode — no improvement
-                cost_reduction = 0.0
-            elif level == 5:
-                _, lat = _execute_with_timeout(self._conn, self._current_sql)
-                cost_reduction = 1.0 - (lat / max(self._baseline_latency, 0.001))
+            if lv == 4:
+                current_total = sum(
+                    _execute_with_timeout(self._conn, q)[1]
+                    for q in self._multi_queries
+                )
+                ratio = 1.0 - (current_total / max(self._baseline_latency, 0.001))
+            elif lv == 5 and self._current_sql == "N_PLUS_ONE":
+                ratio = 0.0  # no improvement yet
             else:
-                _, lat = _execute_with_timeout(self._conn, self._current_sql)
-                cost_reduction = 1.0 - (lat / max(self._baseline_latency, 0.001))
+                if (
+                    not self._current_sql
+                    or self._current_sql.strip().upper().startswith("CREATE TABLE")
+                    or self._current_sql in ("N_PLUS_ONE", "MULTI_QUERY")
+                ):
+                    ratio = 0.0
+                else:
+                    _, lat = _execute_with_timeout(self._conn, self._current_sql)
+                    ratio = 1.0 - (lat / max(self._baseline_latency, 0.001))
         except Exception:
-            cost_reduction = 0.0
+            ratio = 0.0
+
+        # Clamp ratio to [0.0, 1.0] for base reward
+        ratio = max(0.0, min(1.0, ratio))
+        self._cost_reduction_ratio = ratio
+
+        # Early success termination
+        if ratio > 0.95:
+            self._done = True
 
         idx_count = len(self._active_indexes)
         mb_used = self._storage_used_mb
 
-        # Base score from cost reduction, minus small penalties
-        reward = max(0.0, cost_reduction) - (0.02 * idx_count) - (0.005 * mb_used)
-        return max(0.0, min(1.0, reward))
+        reward = ratio - (0.02 * idx_count) - (0.005 * mb_used) - (0.01 * self._state.step_count)
+        # NOTE: intentionally NOT clamped here — negatives are valid RL signal
+        return reward
 
-    # ── data generation ──────────────────────────────────────────────
+    # ── Data generation ───────────────────────────────────────────────────
 
     def _generate_data(self) -> None:
-        """Generate the 100k-row e-commerce dataset with power-law skew."""
+        """Generate the 100k-row e-commerce dataset with Pareto (α=1.1) skew."""
         conn = self._conn
+        ALPHA = 1.1  # Aggressive skew: ~20% of keys → ~80% of rows
 
-        # ── Users: 100k ──
-        conn.execute("""
-            CREATE TABLE users (
-                user_id    INTEGER PRIMARY KEY,
-                username   VARCHAR,
-                email      VARCHAR,
-                signup_date DATE,
-                country    VARCHAR
-            )
-        """)
-
+        # ── Users (100k) ─────────────────────────────────────────────────
         num_users = 100_000
         countries = [
             "US", "UK", "DE", "FR", "JP", "IN", "BR", "CA", "AU", "MX",
             "IT", "ES", "KR", "NL", "SE", "NO", "PL", "RU", "CN", "ZA",
         ]
+        conn.execute("""
+            CREATE TABLE users (
+                user_id     INTEGER PRIMARY KEY,
+                username    VARCHAR,
+                email       VARCHAR,
+                signup_date DATE,
+                country     VARCHAR
+            )
+        """)
         conn.execute(f"""
             INSERT INTO users
             SELECT
@@ -904,7 +1010,12 @@ class DbaTunerEnvironment(Environment):
             FROM generate_series(1, {num_users}) t(i)
         """)
 
-        # ── Products: 10k ──
+        # ── Products (10k) ────────────────────────────────────────────────
+        num_products = 10_000
+        categories = [
+            "Electronics", "Clothing", "Books", "Home", "Sports",
+            "Toys", "Food", "Beauty", "Auto", "Garden",
+        ]
         conn.execute("""
             CREATE TABLE products (
                 product_id INTEGER PRIMARY KEY,
@@ -914,12 +1025,6 @@ class DbaTunerEnvironment(Environment):
                 created_at DATE
             )
         """)
-
-        num_products = 10_000
-        categories = [
-            "Electronics", "Clothing", "Books", "Home", "Sports",
-            "Toys", "Food", "Beauty", "Auto", "Garden",
-        ]
         conn.execute(f"""
             INSERT INTO products
             SELECT
@@ -933,16 +1038,14 @@ class DbaTunerEnvironment(Environment):
             FROM generate_series(1, {num_products}) t(i)
         """)
 
-        # ── Orders: 100k with power-law user_id ──
+        # ── Orders (100k) with Pareto-skewed user_id ─────────────────────
         num_orders = 100_000
-        alpha = 1.5
-
-        # Generate Pareto-skewed user IDs in Python
-        raw = np.random.pareto(a=alpha, size=num_orders) + 1.0
-        user_ids = np.clip(
-            (raw / raw.max() * num_users).astype(int), 1, num_users
-        )
         statuses = ["pending", "completed", "cancelled", "shipped", "returned"]
+
+        raw_u = np.random.pareto(a=ALPHA, size=num_orders) + 1.0
+        user_ids = np.clip(
+            (raw_u / raw_u.max() * num_users).astype(int), 1, num_users
+        )
 
         conn.execute("""
             CREATE TABLE orders (
@@ -953,19 +1056,11 @@ class DbaTunerEnvironment(Environment):
                 total_amount DOUBLE
             )
         """)
-
-        # Batch insert via DuckDB's VALUES
-        # For speed, use a temporary table from a numpy array
-        conn.execute("CREATE TEMPORARY TABLE _tmp_user_ids (uid INTEGER)")
-        # Register numpy array as arrow or use executemany
-        for chunk_start in range(0, num_orders, 10_000):
-            chunk_end = min(chunk_start + 10_000, num_orders)
-            values = ", ".join(
-                str(int(uid)) for uid in user_ids[chunk_start:chunk_end]
-            )
-            conn.execute(
-                f"INSERT INTO _tmp_user_ids SELECT * FROM (VALUES {','.join(f'({int(uid)})' for uid in user_ids[chunk_start:chunk_end])})"
-            )
+        conn.execute("CREATE TEMPORARY TABLE _tmp_uids (uid INTEGER)")
+        for start in range(0, num_orders, 10_000):
+            end = min(start + 10_000, num_orders)
+            vals = ", ".join(f"({int(u)})" for u in user_ids[start:end])
+            conn.execute(f"INSERT INTO _tmp_uids SELECT * FROM (VALUES {vals})")
 
         conn.execute(f"""
             INSERT INTO orders
@@ -979,13 +1074,14 @@ class DbaTunerEnvironment(Environment):
                     {" ".join(f"WHEN {j} THEN '{s}'" for j, s in enumerate(statuses))}
                 END AS status,
                 ROUND(10.0 + random() * 990.0, 2) AS total_amount
-            FROM _tmp_user_ids
+            FROM _tmp_uids
         """)
-        conn.execute("DROP TABLE _tmp_user_ids")
+        conn.execute("DROP TABLE _tmp_uids")
 
-        # ── LineItems: ~300k with power-law product_id ──
+        # ── LineItems (300k) with Pareto-skewed product_id ────────────────
         num_line_items = 300_000
-        raw_p = np.random.pareto(a=alpha, size=num_line_items) + 1.0
+
+        raw_p = np.random.pareto(a=ALPHA, size=num_line_items) + 1.0
         product_ids = np.clip(
             (raw_p / raw_p.max() * num_products).astype(int), 1, num_products
         )
@@ -999,13 +1095,11 @@ class DbaTunerEnvironment(Environment):
                 unit_price   DOUBLE
             )
         """)
-
-        conn.execute("CREATE TEMPORARY TABLE _tmp_prod_ids (pid INTEGER)")
-        for chunk_start in range(0, num_line_items, 10_000):
-            chunk_end = min(chunk_start + 10_000, num_line_items)
-            conn.execute(
-                f"INSERT INTO _tmp_prod_ids SELECT * FROM (VALUES {','.join(f'({int(pid)})' for pid in product_ids[chunk_start:chunk_end])})"
-            )
+        conn.execute("CREATE TEMPORARY TABLE _tmp_pids (pid INTEGER)")
+        for start in range(0, num_line_items, 10_000):
+            end = min(start + 10_000, num_line_items)
+            vals = ", ".join(f"({int(p)})" for p in product_ids[start:end])
+            conn.execute(f"INSERT INTO _tmp_pids SELECT * FROM (VALUES {vals})")
 
         conn.execute(f"""
             INSERT INTO line_items
@@ -1015,11 +1109,28 @@ class DbaTunerEnvironment(Environment):
                 pid AS product_id,
                 1 + CAST(FLOOR(random() * 10) AS INTEGER) AS quantity,
                 ROUND(5.0 + random() * 200.0, 2) AS unit_price
-            FROM _tmp_prod_ids
+            FROM _tmp_pids
         """)
-        conn.execute("DROP TABLE _tmp_prod_ids")
+        conn.execute("DROP TABLE _tmp_pids")
 
-    # ── helpers ──────────────────────────────────────────────────────
+    # ── Helpers ───────────────────────────────────────────────────────────
+
+    def _n_plus_one_query(self, user_id: int) -> str:
+        return (
+            f"SELECT o.order_id, o.user_id, o.total_amount, "
+            f"li.line_item_id, li.product_id, li.quantity, li.unit_price "
+            f"FROM orders o "
+            f"JOIN line_items li ON o.order_id = li.order_id "
+            f"WHERE o.user_id = {user_id} "
+            f"ORDER BY o.order_id, li.line_item_id"
+        )
+
+    def _display_sql(self) -> str:
+        if self._current_sql == "N_PLUS_ONE":
+            return f"-- N+1 loop over user_ids: {self._n_plus_one_user_ids}"
+        if self._current_sql == "MULTI_QUERY":
+            return "\n---\n".join(self._multi_queries)
+        return self._current_sql
 
     def _make_obs(
         self,
@@ -1029,52 +1140,54 @@ class DbaTunerEnvironment(Environment):
         is_correct: bool = True,
         error_message: str = "",
     ) -> DbaTunerObservation:
-        """Build a DbaTunerObservation from current state."""
+        """Build a DbaTunerObservation from current state.
+
+        Reward clamping policy:
+        - Non-terminal steps: raw reward passed through (may be negative).
+        - Terminal steps (done=True):
+            * is_correct=False → reward = 0.0  (hard failure)
+            * is_correct=True  → reward = max(0.0, min(1.0, best_reward_seen))
+        """
         if done is None:
             done = self._done
 
-        # Measure current latency if we have a valid SQL
+        # Only track best reward while episode is still active (no re-tracking after done)
+        if not self._done or not done:
+            self._best_reward = max(self._best_reward, reward)
+
+        # Terminal reward clamping (hackathon scoring requirement)
+        if done:
+            if not is_correct or self._episode_failed:
+                reward = 0.0
+            else:
+                reward = max(0.0, min(1.0, self._best_reward))
+
+        # Measure current latency for the observation
         latency_ms = 0.0
         total_cost = 0.0
-        level = self._scenario.get("level", 1)
+        lv = self._scenario.get("level", 1)
 
         if not error_message and not done:
             try:
-                if level == 4:
+                if lv == 4:
                     for q in self._multi_queries:
                         _, lat = _execute_with_timeout(self._conn, q)
                         latency_ms += lat
                     total_cost = latency_ms
-                elif level == 5 and self._current_sql == "N_PLUS_ONE":
+                elif lv == 5 and self._current_sql == "N_PLUS_ONE":
                     for uid in self._n_plus_one_user_ids:
-                        q = (
-                            f"SELECT o.order_id, o.user_id, o.total_amount, "
-                            f"li.line_item_id, li.product_id, li.quantity, li.unit_price "
-                            f"FROM orders o "
-                            f"JOIN line_items li ON o.order_id = li.order_id "
-                            f"WHERE o.user_id = {uid} "
-                            f"ORDER BY o.order_id, li.line_item_id"
-                        )
-                        _, lat = _execute_with_timeout(self._conn, q)
+                        _, lat = _execute_with_timeout(self._conn, self._n_plus_one_query(uid))
                         latency_ms += lat
                     total_cost = latency_ms
-                elif self._current_sql and self._current_sql not in (
-                    "N_PLUS_ONE", "MULTI_QUERY"
-                ):
-                    _, latency_ms = _execute_with_timeout(
-                        self._conn, self._current_sql
-                    )
-                    total_cost = latency_ms
+                elif self._current_sql and self._current_sql not in ("N_PLUS_ONE", "MULTI_QUERY"):
+                    if self._current_sql.strip().upper().startswith("CREATE TABLE"):
+                        latency_ms = 0.0
+                        total_cost = self._baseline_latency
+                    else:
+                        _, latency_ms = _execute_with_timeout(self._conn, self._current_sql)
+                        total_cost = latency_ms
             except Exception:
                 pass
-
-        current_display = self._current_sql
-        if self._current_sql == "N_PLUS_ONE":
-            current_display = (
-                f"-- N+1 loop over user_ids: {self._n_plus_one_user_ids}"
-            )
-        elif self._current_sql == "MULTI_QUERY":
-            current_display = "\n---\n".join(self._multi_queries)
 
         return DbaTunerObservation(
             query_plan=query_plan,
@@ -1083,14 +1196,24 @@ class DbaTunerEnvironment(Environment):
             storage_used_mb=self._storage_used_mb,
             storage_remaining_mb=self._storage_budget_mb - self._storage_used_mb,
             index_count=len(self._active_indexes),
-            active_indexes=list(self._active_indexes.keys()),
+            active_indexes=[
+                f"{name}: {size:.2f} MB" for name, size in self._active_indexes.items()
+            ],
             is_correct=is_correct,
-            current_sql=current_display,
+            current_sql=self._display_sql(),
             scenario_level=self._scenario.get("level", 1),
             scenario_description=self._scenario.get("description", ""),
             error_message=error_message,
             done=done,
-            reward=max(0.0, min(1.0, reward)),
+            reward=round(reward, 6),
+            metadata={
+                "step_count": self._state.step_count,
+                "episode_id": self._state.episode_id,
+                "cost_reduction_ratio": round(self._cost_reduction_ratio, 4),
+                "reasoning_bonus_paid": self._reasoning_bonus_paid,
+                "mv_created": self._mv_created,
+                "mv_table_name": self._mv_table_name,
+            },
         )
 
     @staticmethod
@@ -1098,16 +1221,16 @@ class DbaTunerEnvironment(Environment):
         """Allow only alphanumeric + underscore in SQL identifiers."""
         sanitised = re.sub(r"[^a-zA-Z0-9_]", "", name)
         if not sanitised:
-            raise ValueError(f"Invalid identifier: {name!r}")
+            raise ValueError(f"Invalid SQL identifier: {name!r}")
         return sanitised
 
     @property
     def state(self) -> State:
-        """Get the current environment state."""
+        """Current environment state (episode_id + step_count)."""
         return self._state
 
     def close(self) -> None:
-        """Clean up DuckDB connection."""
+        """Clean up the DuckDB connection."""
         if self._conn is not None:
             try:
                 self._conn.close()
@@ -1116,42 +1239,38 @@ class DbaTunerEnvironment(Environment):
             self._conn = None
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Direct test
-# ──────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Direct smoke-test
+# ──────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     env = DbaTunerEnvironment()
-    obs = env.reset(seed=42)
-    print(f"Scenario Level: {obs.scenario_level}")
-    print(f"Description: {obs.scenario_description}")
+    obs = env.reset(seed=42, level=1)
+    print(f"Level {obs.scenario_level}: {obs.scenario_description[:80]}…")
     print(f"Baseline latency: {obs.latency_ms:.2f} ms")
-    print(f"Current SQL: {obs.current_sql[:100]}...")
     print()
 
-    # Explain
+    # Step 1: explain (should earn +0.1 bonus)
     obs = env.step(DbaTunerAction(action_type="explain"))
-    print(f"[explain] plan length={len(obs.query_plan)} chars, reward={obs.reward}")
-    print()
+    print(f"[explain]  reward={obs.reward:.4f}  bonus_paid={obs.metadata['reasoning_bonus_paid']}")
 
-    # Get stats
+    # Step 2: explain again (no bonus — already paid)
+    obs = env.step(DbaTunerAction(action_type="explain"))
+    print(f"[explain2] reward={obs.reward:.4f}  bonus_paid={obs.metadata['reasoning_bonus_paid']}")
+
+    # Step 3: get_stats (no bonus — already paid)
     obs = env.step(DbaTunerAction(action_type="get_stats", table="orders"))
-    print(f"[get_stats] plan length={len(obs.query_plan)} chars")
-    print(obs.query_plan[:500])
+    print(f"[get_stats] reward={obs.reward:.4f}")
+    print(obs.query_plan[:600])
     print()
 
-    # Add index
-    obs = env.step(
-        DbaTunerAction(action_type="add_index", table="orders", column="user_id")
-    )
+    # Step 4: add_index
+    obs = env.step(DbaTunerAction(action_type="add_index", table="orders", column="user_id"))
     print(
-        f"[add_index] reward={obs.reward:.4f}, "
-        f"indexes={obs.active_indexes}, "
-        f"storage={obs.storage_used_mb:.2f} MB"
+        f"[add_index] reward={obs.reward:.4f}  "
+        f"indexes={obs.active_indexes}  "
+        f"cost_ratio={obs.metadata['cost_reduction_ratio']}"
     )
-    print()
-
-    # Explain again
-    obs = env.step(DbaTunerAction(action_type="explain"))
-    print(f"[explain] latency={obs.latency_ms:.2f} ms, reward={obs.reward}")
-    print("Done!")
+    print(f"done={obs.done}")
+    env.close()
+    print("\nSmoke-test passed ✓")
