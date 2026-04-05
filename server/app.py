@@ -38,6 +38,17 @@ except (ImportError, SystemError):
     from models import DbaTunerAction, DbaTunerObservation
     from server.dba_tuner_env_environment import DbaTunerEnvironment
 
+import gradio as gr
+import os
+
+def my_gradio_builder(web_manager, action_fields, metadata, is_chat_env, title, quick_start_md):
+    with gr.Blocks() as custom_blocks:
+        readme_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "README.md")
+        if os.path.exists(readme_path):
+            gr.Markdown(open(readme_path, encoding='utf-8').read())
+        else:
+            gr.Markdown("# README.md not found")
+    return custom_blocks
 
 # Create the app with web interface and README integration
 app = create_app(
@@ -46,6 +57,7 @@ app = create_app(
     DbaTunerObservation,
     env_name="dba_tuner_env",
     max_concurrent_envs=4,  # allow concurrent WebSocket sessions
+    gradio_builder=my_gradio_builder,
 )
 
 
