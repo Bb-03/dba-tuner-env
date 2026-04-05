@@ -41,7 +41,9 @@ except (ImportError, SystemError):
 import openenv.core.env_server.web_interface as wi
 import os
 
-def custom_get_quick_start_markdown(metadata, action_cls, observation_cls):
+original_load_readme = wi._load_readme_from_filesystem
+
+def custom_load_readme(env_name):
     readme_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "README.md")
     if os.path.exists(readme_path):
         with open(readme_path, encoding='utf-8') as f:
@@ -52,10 +54,9 @@ def custom_get_quick_start_markdown(metadata, action_cls, observation_cls):
                 if end_idx != -1:
                     content = content[end_idx + 5:].strip()
             return content
-    return "# DBA Tuner Env\n\nNo README.md found."
+    return original_load_readme(env_name)
 
-# Override the default quick start markdown
-wi.get_quick_start_markdown = custom_get_quick_start_markdown
+wi._load_readme_from_filesystem = custom_load_readme
 
 # Create the app with web interface and README integration
 app = create_app(
