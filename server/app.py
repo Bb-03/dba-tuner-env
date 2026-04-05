@@ -38,17 +38,24 @@ except (ImportError, SystemError):
     from models import DbaTunerAction, DbaTunerObservation
     from server.dba_tuner_env_environment import DbaTunerEnvironment
 
-import gradio as gr
+import openenv.core.env_server.web_interface as wi
 import os
 
-def my_gradio_builder(web_manager, action_fields, metadata, is_chat_env, title, quick_start_md):
-    with gr.Blocks() as custom_blocks:
-        readme_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "README.md")
-        if os.path.exists(readme_path):
-            gr.Markdown(open(readme_path, encoding='utf-8').read())
-        else:
-            gr.Markdown("# README.md not found")
-    return custom_blocks
+def custom_get_quick_start_markdown(metadata, action_cls, observation_cls):
+    readme_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "README.md")
+    if os.path.exists(readme_path):
+        with open(readme_path, encoding='utf-8') as f:
+            content = f.read()
+            # Strip YAML frontmatter if it exists
+            if content.startswith("---\n"):
+                end_idx = content.find("\n---\n")
+                if end_idx != -1:
+                    content = content[end_idx + 5:].strip()
+            return content
+    return "# DBA Tuner Env\n\nNo README.md found."
+
+# Override the default quick start markdown
+wi.get_quick_start_markdown = custom_get_quick_start_markdown
 
 # Create the app with web interface and README integration
 app = create_app(
@@ -57,7 +64,6 @@ app = create_app(
     DbaTunerObservation,
     env_name="dba_tuner_env",
     max_concurrent_envs=4,  # allow concurrent WebSocket sessions
-    gradio_builder=my_gradio_builder,
 )
 
 
