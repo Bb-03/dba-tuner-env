@@ -87,54 +87,66 @@ SCENARIOS: List[Dict[str, Any]] = [
         "max_steps": 10,
         "storage_budget_mb": 50.0,
     },
-    # ── Level 2: Missing FK join index → Index Nested-Loop Join ──────────
+    # ── Level 2: Large-table point lookup → index on line_items ────────────
     {
         "level": 2,
         "description": (
-            "Level 2 (Medium) — Missing Foreign Key Join Index.\n"
-            "A join between orders and line_items on order_id uses a Hash Join because "
-            "there is no index on line_items.order_id. Add an index on the FK column to "
-            "enable an Index Nested-Loop Join.\n"
+            "Level 2 (Medium) — Large Table Point Lookup.\n"
+            "A filter on line_items.product_id scans all 300k rows to find orders for "
+            "a single product. Without an index, DuckDB does a full sequential scan. "
+            "Add an index on line_items.product_id to enable an ART index seek that "
+            "fetches only matching rows from 300k.\n"
             + _SCHEMA_HINT
         ),
         "gold_sql": (
-            "SELECT o.order_id, o.user_id, o.total_amount, "
-            "li.product_id, li.quantity, li.unit_price "
-            "FROM orders o JOIN line_items li ON o.order_id = li.order_id "
-            "WHERE o.status = 'completed' "
-            "ORDER BY o.order_date DESC LIMIT 100"
+            "SELECT product_id, order_id, quantity, unit_price, "
+            "quantity * unit_price AS line_total "
+            "FROM line_items "
+            "WHERE product_id = 42 "
+            "ORDER BY line_total DESC"
         ),
         "initial_sql": (
-            "SELECT o.order_id, o.user_id, o.total_amount, "
-            "li.product_id, li.quantity, li.unit_price "
-            "FROM orders o JOIN line_items li ON o.order_id = li.order_id "
-            "WHERE o.status = 'completed' "
-            "ORDER BY o.order_date DESC LIMIT 100"
+            "SELECT product_id, order_id, quantity, unit_price, "
+            "quantity * unit_price AS line_total "
+            "FROM line_items "
+            "WHERE product_id = 42 "
+            "ORDER BY line_total DESC"
         ),
         "max_steps": 15,
         "storage_budget_mb": 50.0,
     },
-    # ── Level 3: Correlated subquery → window function / CTE ─────────────
+    # ── Level 3: Multi-scan UNION ALL → single-scan CASE consolidation ────
     {
         "level": 3,
         "description": (
-            "Level 3 (Medium) — Correlated Subquery Refactoring.\n"
-            "The initial query uses a correlated subquery that re-scans the orders "
-            "table once per row, causing O(n²) complexity. Rewrite it using a window "
-            "function (SUM OVER PARTITION BY) or a CTE to perform a single-pass scan.\n"
+            "Level 3 (Medium) — Redundant Table Scan Consolidation.\n"
+            "The initial query scans the orders table THREE separate times (via UNION "
+            "ALL) to compute segment counts. DuckDB cannot auto-merge UNION ALL scans. "
+            "Rewrite into a single scan using CASE WHEN expressions inside GROUP BY to "
+            "compute all three segments in one pass — this should yield ~3x speedup.\n"
             + _SCHEMA_HINT
         ),
         "gold_sql": (
-            "SELECT user_id, order_id, total_amount, "
-            "SUM(total_amount) OVER (PARTITION BY user_id) AS user_total "
-            "FROM orders WHERE status = 'completed'"
+            "SELECT "
+            "CASE "
+            "WHEN total_amount > 500 THEN 'high' "
+            "WHEN total_amount >= 100 THEN 'medium' "
+            "ELSE 'low' "
+            "END AS segment, "
+            "COUNT(*) AS cnt, "
+            "ROUND(SUM(total_amount), 2) AS total "
+            "FROM orders WHERE status = 'completed' "
+            "GROUP BY segment"
         ),
         "initial_sql": (
-            "SELECT user_id, order_id, total_amount, "
-            "(SELECT SUM(o2.total_amount) FROM orders o2 "
-            "WHERE o2.user_id = orders.user_id AND o2.status = 'completed') "
-            "AS user_total "
-            "FROM orders WHERE status = 'completed'"
+            "SELECT 'high' AS segment, COUNT(*) AS cnt, ROUND(SUM(total_amount), 2) AS total "
+            "FROM orders WHERE status = 'completed' AND total_amount > 500 "
+            "UNION ALL "
+            "SELECT 'medium', COUNT(*), ROUND(SUM(total_amount), 2) "
+            "FROM orders WHERE status = 'completed' AND total_amount BETWEEN 100 AND 500 "
+            "UNION ALL "
+            "SELECT 'low', COUNT(*), ROUND(SUM(total_amount), 2) "
+            "FROM orders WHERE status = 'completed' AND total_amount < 100"
         ),
         "max_steps": 15,
         "storage_budget_mb": 50.0,
@@ -199,25 +211,28 @@ SCENARIOS: List[Dict[str, Any]] = [
         "max_steps": 20,
         "storage_budget_mb": 50.0,
     },
-    # ── Level 6: Range scan on order_date ────────────────────────────────
+    # ── Level 6: Narrow range scan → ART index on date column ─────────────
     {
         "level": 6,
         "description": (
-            "Level 6 (Hard — Architectural) — Range Scan Optimisation.\n"
-            "A BETWEEN range filter on order_date performs a full table scan on 100k "
-            "rows. Add an index on orders.order_date to enable an efficient range seek.\n"
+            "Level 6 (Hard — Architectural) — Selective Range Scan Optimisation.\n"
+            "A BETWEEN filter on order_date selects only ~2% of rows (1 week out of a "
+            "full year), but DuckDB still performs a full sequential scan on 100k rows. "
+            "Add an ART index on orders.order_date to enable an efficient range seek "
+            "that skips 98% of the table. Optionally, CREATE a clustered copy sorted "
+            "by order_date for zone-map pruning.\n"
             + _SCHEMA_HINT
         ),
         "gold_sql": (
             "SELECT order_id, user_id, order_date, total_amount "
             "FROM orders "
-            "WHERE order_date BETWEEN '2023-06-01' AND '2023-12-31' "
+            "WHERE order_date BETWEEN '2023-06-15' AND '2023-06-21' "
             "ORDER BY order_date"
         ),
         "initial_sql": (
             "SELECT order_id, user_id, order_date, total_amount "
             "FROM orders "
-            "WHERE order_date BETWEEN '2023-06-01' AND '2023-12-31' "
+            "WHERE order_date BETWEEN '2023-06-15' AND '2023-06-21' "
             "ORDER BY order_date"
         ),
         "max_steps": 15,
@@ -325,12 +340,101 @@ def _estimate_index_size_mb(
 
 
 def _parse_explain_cost(explain_text: str) -> float:
-    """Sum all numeric values from EXPLAIN ANALYZE output as a synthetic cost."""
+    """Extract total execution time from EXPLAIN ANALYZE timing values only.
+
+    Uses regex (\d+\.\d+)s to capture only seconds-denominated values,
+    ignoring row counts, cardinality estimates, and other numeric noise.
+    """
     total = 0.0
     for line in explain_text.split("\n"):
-        for n in re.findall(r"(\d+\.\d+)", line):
+        for n in re.findall(r"(\d+\.\d+)s", line):
             total += float(n)
-    return total if total > 0 else 1.0
+    return total if total > 0 else 0.0001
+
+
+def _shrink_plan(raw_plan: str, top_n: int = 5) -> str:
+    """Compress DuckDB EXPLAIN ANALYZE output to the top-N costliest nodes.
+
+    Strips box-drawing characters and tuple artifacts, extracts operator nodes
+    with timing data, and returns a compact summary sorted by execution time.
+    This keeps LLM payloads small and avoids 413 errors.
+    """
+    # Clean tuple wrappers from str(row) and box-drawing chars
+    text = raw_plan
+    text = re.sub(r"\('", "", text)
+    text = re.sub(r"',\)", "", text)
+    text = re.sub(r"[─│┌┐└┘├┤┬┴┼═║╔╗╚╝╠╣╦╩╬┃┏┓┗┛]", "", text)
+
+    # Known DuckDB operator keywords
+    _OPS = re.compile(
+        r"(SEQ_SCAN|INDEX_SCAN|HASH_JOIN|NESTED_LOOP_JOIN|MERGE_JOIN|"
+        r"HASH_GROUP_BY|PERFECT_HASH_GROUP_BY|FILTER|PROJECTION|ORDER_BY|"
+        r"TOP_N|LIMIT|UNGROUPED_AGGREGATE|STREAMING_WINDOW|"
+        r"CROSS_PRODUCT|DELIM_SCAN|COLUMN_DATA_SCAN|PIECEWISE_MERGE_JOIN)",
+        re.IGNORECASE,
+    )
+    _TIME = re.compile(r"(\d+\.?\d*)\s*s(?:ec)?")
+    _ROWS = re.compile(r"~?(\d[\d,]*)\s*(?:rows|tuples)?")
+
+    nodes: List[Tuple[float, str]] = []
+    lines = text.split("\n")
+
+    for i, raw_line in enumerate(lines):
+        line = raw_line.strip()
+        m = _OPS.search(line)
+        if not m:
+            continue
+        op_name = m.group(1).upper()
+        time_val = 0.0
+        row_info = ""
+        # Scan this line + next 3 for timing / row info
+        for j in range(i, min(i + 4, len(lines))):
+            ctx = lines[j].strip()
+            tm = _TIME.search(ctx)
+            if tm:
+                time_val = max(time_val, float(tm.group(1)))
+            rm = _ROWS.search(ctx)
+            if rm and not row_info:
+                row_info = rm.group(0)
+        summary = op_name
+        if row_info:
+            summary += f" ({row_info})"
+        summary += f" [{time_val:.4f}s]"
+        nodes.append((time_val, summary))
+
+    if not nodes:
+        # Fallback: return cleaned text truncated to 15 lines
+        clean_lines = [l.strip() for l in lines if l.strip() and len(l.strip()) > 2]
+        return "\n".join(clean_lines[:15])
+
+    # Sort by time descending, take top N
+    nodes.sort(key=lambda x: x[0], reverse=True)
+    top = nodes[:top_n]
+
+    result_lines = [f"Top-{len(top)} costliest operators:"]
+    for _, summary in top:
+        result_lines.append(f"  -> {summary}")
+    total_time = sum(t for t, _ in nodes)
+    result_lines.append(f"  Total plan time: {total_time:.4f}s across {len(nodes)} operators")
+    return "\n".join(result_lines)
+
+
+def _get_explain_cost(
+    conn: duckdb.DuckDBPyConnection, sql: str
+) -> float:
+    """Get deterministic estimated cost from EXPLAIN ANALYZE (averaged).
+
+    Runs EXPLAIN ANALYZE 3 times and averages to smooth out sub-millisecond
+    timing jitter that causes reward signal noise.
+    """
+    try:
+        samples = []
+        for _ in range(3):
+            rows = conn.execute(f"EXPLAIN ANALYZE {sql}").fetchall()
+            samples.append(_parse_explain_cost("\n".join(str(r) for r in rows)))
+        return sum(samples) / len(samples) if samples else 0.0001
+    except Exception:
+        return 0.0001
 
 
 def _extract_create_table_name(sql: str) -> Optional[str]:
@@ -479,7 +583,9 @@ class DbaTunerEnvironment(Environment):
                 _, lat = _execute_with_timeout(self._conn, q)
                 self._multi_baselines.append(lat)
             self._baseline_latency = sum(self._multi_baselines)
-            self._baseline_cost = self._baseline_latency
+            self._baseline_cost = sum(
+                _get_explain_cost(self._conn, q) for q in self._multi_queries
+            )
 
         elif lv == 5:
             self._n_plus_one_user_ids = self._scenario["n_plus_one_user_ids"]
@@ -491,7 +597,10 @@ class DbaTunerEnvironment(Environment):
                 _, lat = _execute_with_timeout(self._conn, q)
                 total_lat += lat
             self._baseline_latency = total_lat
-            self._baseline_cost = total_lat
+            self._baseline_cost = sum(
+                _get_explain_cost(self._conn, self._n_plus_one_query(uid))
+                for uid in self._n_plus_one_user_ids
+            )
 
         else:
             self._gold_sql = self._scenario["gold_sql"]
@@ -653,6 +762,7 @@ class DbaTunerEnvironment(Environment):
             ).fetchall()
             plan_text = "\n".join(str(r) for r in rows)
 
+        plan_text = _shrink_plan(plan_text)
         reward = self._calculate_reward() + bonus
         return self._make_obs(query_plan=plan_text, reward=reward)
 
@@ -834,9 +944,14 @@ class DbaTunerEnvironment(Environment):
                 else:
                     # Rename agent columns to gold columns to be alias-tolerant
                     df_agent.columns = df_gold.columns
+                    # Round float columns to 4 decimal places for tolerance
+                    for col in df_gold.columns:
+                        if df_gold[col].dtype in ('float64', 'float32'):
+                            df_gold[col] = df_gold[col].round(4)
+                            df_agent[col] = df_agent[col].round(4)
                     sort_cols = list(df_gold.columns)
-                    df_agent = df_agent.sort_values(by=sort_cols).reset_index(drop=True)
-                    df_gold = df_gold.sort_values(by=sort_cols).reset_index(drop=True)
+                    df_agent = df_agent.sort_values(by=sort_cols, na_position='last').reset_index(drop=True)
+                    df_gold = df_gold.sort_values(by=sort_cols, na_position='last').reset_index(drop=True)
                     is_correct = df_agent.equals(df_gold)
 
             except Exception as e:
@@ -864,8 +979,16 @@ class DbaTunerEnvironment(Environment):
 
         # ── Compute reward ────────────────────────────────────────────────
         reward = self._calculate_reward()
+        cost_pct = f"{self._cost_reduction_ratio:.1%}"
+        if self._cost_reduction_ratio > 0:
+            feedback = f"Query rewritten successfully. Cost reduction: {cost_pct}."
+        else:
+            feedback = (
+                "Query rewritten — no cost improvement detected. "
+                "Try adding indexes on columns used in WHERE/JOIN clauses first."
+            )
         return self._make_obs(
-            query_plan="Query rewritten successfully.",
+            query_plan=feedback,
             reward=reward,
             is_correct=True,
         )
@@ -951,13 +1074,13 @@ class DbaTunerEnvironment(Environment):
 
         Formula:
             CostReductionRatio
-            − 0.02 × index_count
-            − 0.005 × storage_used_mb
-            − 0.01 × step_count
+            - 0.02  x index_count
+            - 0.005 x storage_used_mb
+            - 0.005 x step_count
 
         The ratio is clamped to [0, 1] before penalty subtraction so that an
         *increase* in cost does not produce a strongly negative base.
-        Penalties may still push the final value negative — this is intentional
+        Penalties may still push the final value negative -- this is intentional
         RL signal.  Terminal clamping to [0.0, 1.0] is applied in _make_obs.
         """
         lv = self._scenario["level"]
@@ -965,11 +1088,11 @@ class DbaTunerEnvironment(Environment):
 
         try:
             if lv == 4:
-                current_total = sum(
-                    _execute_with_timeout(self._conn, q)[1]
+                current_cost = sum(
+                    _get_explain_cost(self._conn, q)
                     for q in self._multi_queries
                 )
-                ratio = 1.0 - (current_total / max(self._baseline_latency, 0.001))
+                ratio = 1.0 - (current_cost / max(self._baseline_cost, 0.001))
             elif lv == 5 and self._current_sql == "N_PLUS_ONE":
                 ratio = 0.0  # no improvement yet
             else:
@@ -980,8 +1103,8 @@ class DbaTunerEnvironment(Environment):
                 ):
                     ratio = 0.0
                 else:
-                    _, lat = _execute_with_timeout(self._conn, self._current_sql)
-                    ratio = 1.0 - (lat / max(self._baseline_latency, 0.001))
+                    current_cost = _get_explain_cost(self._conn, self._current_sql)
+                    ratio = 1.0 - (current_cost / max(self._baseline_cost, 0.001))
         except Exception:
             ratio = 0.0
 
@@ -996,9 +1119,8 @@ class DbaTunerEnvironment(Environment):
         idx_count = len(self._active_indexes)
         mb_used = self._storage_used_mb
 
-        # Penalty: 0.02 per index, 0.005 per MB, 0.02 per step (increased from 0.01)
-        reward = ratio - (0.02 * idx_count) - (0.005 * mb_used) - (0.02 * self._state.step_count)
-        # NOTE: intentionally NOT clamped here — negatives are valid RL signal
+        reward = ratio - (0.02 * idx_count) - (0.005 * mb_used) - (0.005 * self._state.step_count)
+        # NOTE: intentionally NOT clamped here -- negatives are valid RL signal
         return reward
 
     # ── Data generation ───────────────────────────────────────────────────
@@ -1199,19 +1321,24 @@ class DbaTunerEnvironment(Environment):
                     for q in self._multi_queries:
                         _, lat = _execute_with_timeout(self._conn, q)
                         latency_ms += lat
-                    total_cost = latency_ms
+                    total_cost = sum(
+                        _get_explain_cost(self._conn, q) for q in self._multi_queries
+                    )
                 elif lv == 5 and self._current_sql == "N_PLUS_ONE":
                     for uid in self._n_plus_one_user_ids:
                         _, lat = _execute_with_timeout(self._conn, self._n_plus_one_query(uid))
                         latency_ms += lat
-                    total_cost = latency_ms
+                    total_cost = sum(
+                        _get_explain_cost(self._conn, self._n_plus_one_query(uid))
+                        for uid in self._n_plus_one_user_ids
+                    )
                 elif self._current_sql and self._current_sql not in ("N_PLUS_ONE", "MULTI_QUERY"):
                     if self._current_sql.strip().upper().startswith("CREATE TABLE"):
                         latency_ms = 0.0
-                        total_cost = self._baseline_latency
+                        total_cost = self._baseline_cost
                     else:
                         _, latency_ms = _execute_with_timeout(self._conn, self._current_sql)
-                        total_cost = latency_ms
+                        total_cost = _get_explain_cost(self._conn, self._current_sql)
             except Exception:
                 pass
 

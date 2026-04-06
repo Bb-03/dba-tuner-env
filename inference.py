@@ -117,21 +117,22 @@ AVAILABLE ACTIONS (respond with ONLY a valid JSON object — no markdown, no exp
    the view, then submit a SELECT FROM that table — only the SELECT is graded.
 
 REWARD SIGNAL:
-  +CostReductionRatio   Proportional to latency reduction (0.0 → 1.0).
+  +CostReductionRatio   Proportional to EXPLAIN cost reduction (0.0 -> 1.0).
   +0.1                  One-time bonus for your FIRST explain or get_stats call.
-  −0.02 × indexes       Penalty per index created (over-indexing is penalised).
-  −0.005 × MB_used      Penalty per MB of index storage.
-  −0.01 × step          Efficiency penalty per step — solve it quickly!
+  -0.02 x indexes       Penalty per index created (over-indexing is penalised).
+  -0.005 x MB_used      Penalty per MB of index storage.
+  -0.005 x step         Efficiency penalty per step -- solve it quickly!
   Terminal score        Clamped to [0.0, 1.0] when done=true.
 
 OPTIMAL STRATEGY:
   1. ALWAYS start with explain (earns reasoning bonus + reveals scan type).
   2. Use get_stats on the WHERE / JOIN columns to confirm high selectivity.
-  3. Add at most 2-3 targeted indexes — more is penalised.
-  4. Only rewrite SQL when the scenario explicitly requires it (subqueries, N+1).
-  5. For N+1 (Level 5): rewrite using WHERE user_id IN (...) batch join.
-  6. For Budget Challenge (Level 4): index orders.user_id and line_items.order_id first.
-  7. Stop early — the environment will end successfully when cost drops > 95%.
+  3. Add at most 2-3 targeted indexes -- more is penalised.
+  4. Only rewrite SQL when the scenario explicitly requires it (UNION ALL, N+1).
+  5. For Level 3 (UNION ALL): consolidate multiple scans into a single CASE WHEN GROUP BY.
+  6. For N+1 (Level 5): rewrite using WHERE user_id IN (...) batch join.
+  7. For Budget Challenge (Level 4): index orders.user_id and line_items.product_id first.
+  8. Stop early -- the environment will end successfully when cost drops > 95%.
 
 IMPORTANT: First, think step-by-step in a <thought>...</thought> block about your observations and strategy. Then, output exactly ONE JSON action object.
 DANGER: Do NOT repeat any action (like explain or get_stats) twice in a row with identical parameters. Each step costs efficiency bonus, and IDENTICAL CONSECUTIVE actions will kill the episode with a -0.1 penalty.
@@ -144,8 +145,12 @@ def build_user_message(obs, step_num: int, prev_actions: list) -> str:
     """Construct the per-step observation message for the LLM."""
     history = ""
     if prev_actions:
-        history = "\nPrevious actions this episode:\n" + "\n".join(
-            f"  Step {i + 1}: {a}" for i, a in enumerate(prev_actions)
+        # Sliding window: only send last 3 actions to control context size
+        # and prevent 413 Request Entity Too Large errors
+        recent = prev_actions[-3:]
+        offset = len(prev_actions) - len(recent)
+        history = f"\nRecent actions (last {len(recent)} of {len(prev_actions)} total):\n" + "\n".join(
+            f"  Step {offset + i + 1}: {a}" for i, a in enumerate(recent)
         )
 
     cost_ratio = obs.metadata.get("cost_reduction_ratio", 0.0) if obs.metadata else 0.0
