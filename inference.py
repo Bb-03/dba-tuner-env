@@ -7,7 +7,7 @@ Demonstrates a full "Thinking Trajectory" across all 7 task levels:
 MANDATORY environment variables:
     HF_TOKEN        Your Hugging Face API key (or any OpenAI-compatible key).
     API_BASE_URL    LLM endpoint  (default: HuggingFace router).
-    MODEL_NAME      Model identifier (default:meta-llama/Llama-3.1-8B-Instruct).
+    MODEL_NAME      Model identifier (default:Qwen/Qwen2.5-72B-Instruct).
 
 STDOUT FORMAT  (one line type per event, in order):
     [START] task=<name> env=dba_tuner_env model=<model>
@@ -40,9 +40,14 @@ from server.dba_tuner_env_environment import DbaTunerEnvironment
 from models import DbaTunerAction
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-API_KEY      = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
-API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-MODEL_NAME = os.getenv("MODEL_NAME", "meta-llama/Llama-3.1-8B-Instruct")
+API_KEY      = os.getenv("HF_TOKEN") or os.getenv("API_KEY") or os.getenv("GROQ_API_KEY")
+
+# Detection: If key starts with gsk_, default to Groq endpoint
+is_groq = API_KEY.startswith("gsk_") if API_KEY else False
+DEFAULT_BASE_URL = "https://api.groq.com/openai/v1" if is_groq else "https://router.huggingface.co/v1"
+API_BASE_URL = os.getenv("API_BASE_URL", DEFAULT_BASE_URL)
+
+MODEL_NAME = os.getenv("MODEL_NAME", "llama-3.3-70b-versatile" if is_groq else "meta-llama/Llama-3.1-8B-Instruct")
 
 BENCHMARK    = "dba_tuner_env"
 MAX_STEPS    = 25  # must cover the hardest scenario (Level 4: max_steps=25)
@@ -129,6 +134,7 @@ OPTIMAL STRATEGY:
   7. Stop early — the environment will end successfully when cost drops > 95%.
 
 IMPORTANT: First, think step-by-step in a <thought>...</thought> block about your observations and strategy. Then, output exactly ONE JSON action object.
+DANGER: Do NOT repeat any action (like explain or get_stats) twice in a row with identical parameters. Each step costs efficiency bonus, and IDENTICAL CONSECUTIVE actions will kill the episode with a -0.1 penalty.
 """)
 
 
@@ -165,7 +171,10 @@ Query Plan / Info:
 Error: {obs.error_message if obs.error_message else 'none'}
 {history}
 
-Step {step_num} of {MAX_STEPS}. Respond with your next action as JSON:\
+Step {step_num} of {MAX_STEPS}. 
+HINT: If you have already achieved a high Cost-Reduction (>50%) and cannot find further improvements, call {{"action_type": "done"}} to finalize your score and earn the maximum terminal reward.
+
+Respond with your next action as JSON:\
 """)
 
 
@@ -199,8 +208,8 @@ def format_action_str(action: DbaTunerAction) -> str:
     if action.action_type == "drop_index":
         return f"drop_index({action.index_name})"
     if action.action_type == "rewrite":
-        preview = (action.new_sql or "")[:60].replace("\n", " ")
-        return f"rewrite({preview})"
+        preview = (action.new_sql or "")[:120].replace("\n", " ")
+        return f"rewrite({preview}...)"
     return f"{action.action_type}()"
 
 
@@ -230,7 +239,7 @@ def run_task(
                 {"role": "user",   "content": build_user_message(obs, step_num, prev_actions)},
             ]
 
-            # Call LLM (with retry logic for 429/402 errors)
+            # Call LLM (with retry logic for transient errors)
             max_retries = 5
             llm_text = ""
             for attempt in range(max_retries):
@@ -239,16 +248,26 @@ def run_task(
                         model=model_name,
                         messages=messages,
                         temperature=0.1,
-                        max_tokens=800,  # increased to allow thoughts
+                        max_tokens=800,
                     )
                     llm_text = resp.choices[0].message.content or ""
                     break  # Success
                 except Exception as e:
+                    # Fail-fast on quota/auth errors (401, 402)
+                    err_str = str(e).lower()
+                    if "402" in err_str or "payment" in err_str:
+                        print(f"\n[FATAL] API Quota Exhausted (402): {e}", file=sys.stderr)
+                        print("TIP: Switch to Groq (free) by setting HF_TOKEN to a Groq API key.", file=sys.stderr)
+                        sys.exit(1)
+                    if "401" in err_str or "unauthorized" in err_str:
+                        print(f"\n[FATAL] Invalid API Key (401): {e}", file=sys.stderr)
+                        sys.exit(1)
+
                     print(f"  [API ERROR] Attempt {attempt + 1}/{max_retries} failed: {e}", file=sys.stderr)
                     if attempt < max_retries - 1:
                         time.sleep(5)
                     else:
-                        llm_text = '{"action_type": "explain"}'  # safe fallback after all retries fail
+                        llm_text = '{"action_type": "explain"}'
 
             # Parse action
             try:
