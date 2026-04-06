@@ -405,8 +405,11 @@ class DbaTunerEnvironment(Environment):
         self._multi_queries: List[str] = []
         self._multi_baselines: List[float] = []
 
-        # Level 5 N+1 state
+        # N+1 state (Level 5)
         self._n_plus_one_user_ids: List[int] = []
+
+        # Duplicate action detection (global)
+        self._last_action_json: str = ""
 
     # ── Reset ─────────────────────────────────────────────────────────────
 
@@ -445,6 +448,7 @@ class DbaTunerEnvironment(Environment):
         self._storage_used_mb = 0.0
         self._done = False
         self._last_rewrite_sql = ""
+        self._last_action_json = ""
         self._best_reward = 0.0
         self._cost_reduction_ratio = 0.0
         self._episode_failed = False
@@ -547,6 +551,27 @@ class DbaTunerEnvironment(Environment):
             )
 
         self._state.step_count += 1
+
+        # ── Duplicate action detection (global) ───────────────────────────
+        # Normalize action to detect identical repeats (including parameters)
+        try:
+            import json  # noqa: PLC0415
+            current_action_json = json.dumps(action.dict(), sort_keys=True)
+            if current_action_json == self._last_action_json and action.action_type != "done":
+                self._done = True
+                self._episode_failed = True
+                return self._make_obs(
+                    error_message=(
+                        f"Repeated action '{action.action_type}' with identical parameters detected. "
+                        "Episode terminated for efficiency — solve it, don't loop."
+                    ),
+                    reward=-0.1,
+                    is_correct=False,
+                    done=True,
+                )
+            self._last_action_json = current_action_json
+        except Exception:
+            pass
 
         if self._state.step_count >= self._max_steps:
             self._done = True
@@ -971,7 +996,8 @@ class DbaTunerEnvironment(Environment):
         idx_count = len(self._active_indexes)
         mb_used = self._storage_used_mb
 
-        reward = ratio - (0.02 * idx_count) - (0.005 * mb_used) - (0.01 * self._state.step_count)
+        # Penalty: 0.02 per index, 0.005 per MB, 0.02 per step (increased from 0.01)
+        reward = ratio - (0.02 * idx_count) - (0.005 * mb_used) - (0.02 * self._state.step_count)
         # NOTE: intentionally NOT clamped here — negatives are valid RL signal
         return reward
 

@@ -1,0 +1,13 @@
+.git
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.db
+uv.lock
+.env
+.ipynb_checkpoints
+.pytest_cache
+.vscode
+.idea
