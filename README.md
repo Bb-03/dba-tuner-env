@@ -29,7 +29,8 @@ materialised views, N+1 pattern fixes, and multi-query budget challenges.**
 | **Backend** | DuckDB (in-memory, `:memory:`) |
 | **Dataset** | 100k-row Pareto-skewed (α=1.1) e-commerce data |
 | **Levels** | 7 (Easy → Expert) |
-| **Reward** | Continuous [0.0 → 1.0], multi-faceted |
+| **Reward** | Continuous [0.0 → 1.0], deterministic plan-cost-based |
+| **Reproducible** | `reset(seed=N)` produces identical datasets every time |
 | **Hardware** | 8 GB RAM / 2 vCPU |
 
 ---
@@ -41,7 +42,7 @@ from server.dba_tuner_env_environment import DbaTunerEnvironment
 from models import DbaTunerAction
 
 env = DbaTunerEnvironment()
-obs = env.reset(level=1)          # or omit level for random pick
+obs = env.reset(seed=42, level=1)     # deterministic dataset from seed
 print(obs.scenario_description)
 
 # Thinking trajectory: explain → get_stats → add_index
@@ -54,7 +55,7 @@ print(obs.query_plan)             # column stats with est_index_size
 obs = env.step(DbaTunerAction(
     action_type="add_index", table="orders", column="user_id"
 ))
-print(f"Reward: {obs.reward:.4f}   Cost-reduction: {obs.metadata['cost_reduction_ratio']:.2%}")
+print(f"Reward: {obs.reward:.2f}   Cost-reduction: {obs.metadata['cost_reduction_ratio']:.2%}")
 
 env.close()
 ```
@@ -80,9 +81,9 @@ line_items (300 000 rows)  line_item_id, order_id, product_id★, quantity, unit
 | Level | Name | Goal |
 |-------|------|------|
 | 1 | Sequential Scan | Add index on `orders.user_id` |
-| 2 | FK Join Index | Index `line_items.order_id` for Hash→Nested-Loop |
-| 3 | Subquery Refactor | Replace correlated subquery with window function |
-| 4 | Budget Challenge | Optimise 5 queries within 50 MB index limit |
+| 2 | Large Table Point Lookup | Index `line_items.product_id` for point lookups |
+| 3 | Redundant Scan Consolidation | UNION ALL → single CASE WHEN GROUP BY |
+| 4 | Budget Challenge | Optimise 5 queries within 50 MB index limit (index-only, no rewrite) |
 | 5 | N+1 Fix | Collapse per-row SELECTs into a single batch JOIN |
 | 6 | Range Scan | Index `orders.order_date` for BETWEEN queries |
 | 7 | Materialised View | CREATE TABLE AS → SELECT from it (5-table join) |
@@ -97,6 +98,8 @@ line_items (300 000 rows)  line_item_id, order_id, product_id★, quantity, unit
 {"action_type": "add_index",  "table": "orders",  "column": "user_id"}
 {"action_type": "drop_index", "index_name": "idx_orders_user_id"}
 {"action_type": "rewrite",    "new_sql": "SELECT ..."}
+{"action_type": "create_materialized_view", "view_name": "top_users", "sql": "SELECT ..."}
+{"action_type": "done"}
 ```
 
 ---
@@ -104,19 +107,45 @@ line_items (300 000 rows)  line_item_id, order_id, product_id★, quantity, unit
 ## Reward Function
 
 ```
-Reward = CostReductionRatio                     # (baseline_latency - current_latency) / baseline
+Reward = CostReductionRatio                     # (baseline_cost - current_cost) / baseline_cost
        + 0.1  (one-time)                        # first explain or get_stats call
        - 0.02 × index_count                     # over-indexing penalty
        - 0.005 × storage_used_mb                # storage waste penalty
-       - 0.01 × step_count                      # efficiency penalty
+       - 0.005 × step_count                     # efficiency penalty
+
+Cost is measured via EXPLAIN plan estimated rows (deterministic, no timing).
 
 Terminal score (done=True):
-  is_correct=True  → max(0.0, min(1.0, best_step_reward))
-  is_correct=False → 0.0  (wrong results = zero)
+  task_solved=True  → max(0.0, min(1.0, best_step_reward))
+  task_solved=False → 0.0  (explain/get_stats bonuses alone cannot win)
+  is_correct=False  → 0.0  (wrong results = zero)
+
+task_solved requires cost_reduction_ratio > 0.3 (meaningful optimisation).
 ```
 
 Step rewards during an episode may be **negative** (RL signal).
 The final episode score is always in **[0.0, 1.0]**.
+
+---
+
+## Reward Model
+
+A typed `DbaTunerReward` Pydantic model is available for structured reward metadata:
+
+```python
+from models import DbaTunerReward
+
+reward = DbaTunerReward(
+    step_reward=0.35,
+    terminal_reward=0.35,
+    task_solved=True,
+    cost_reduction_ratio=0.42,
+    index_penalty=-0.02,
+    storage_penalty=-0.004,
+    step_penalty=-0.015,
+    reasoning_bonus=0.1,
+)
+```
 
 ---
 
@@ -143,11 +172,14 @@ python server/dba_tuner_env_environment.py
 
 ```
 [START] task=simple_index env=dba_tuner_env model=Qwen/Qwen2.5-72B-Instruct
-[STEP]  step=1 action=explain() reward=0.0900 done=false error=null
-[STEP]  step=2 action=get_stats(orders) reward=0.0389 done=false error=null
-[STEP]  step=3 action=add_index(orders,user_id) reward=0.2901 done=false error=null
-[END]   success=true steps=3 score=0.2901 avg_reward=0.1396 rewards=0.0900,0.0389,0.2901
+[STEP] step=1 action=explain() reward=0.09 done=false error=null
+[STEP] step=2 action=get_stats(orders) reward=0.04 done=false error=null
+[STEP] step=3 action=add_index(orders,user_id) reward=0.29 done=false error=null
+[END] success=true steps=3 score=0.29 rewards=0.09,0.04,0.29
 ```
+
+Only `[START]`, `[STEP]`, and `[END]` lines are emitted on stdout.
+The `[END]` score is the final terminal reward from the environment.
 
 ---
 
@@ -155,7 +187,7 @@ python server/dba_tuner_env_environment.py
 
 ```
 dba-tuner-env/
-├── models.py                          # Action + Observation Pydantic models
+├── models.py                          # Action + Observation + Reward Pydantic models
 ├── inference.py                       # LLM inference script (all 7 tasks)
 ├── client.py                          # WebSocket client (DbaTunerEnv)
 ├── openenv.yaml                       # OpenEnv manifest

@@ -1,14 +1,69 @@
 """
 Data models for the DBA Tuner Env Environment.
 
-Defines a discriminated-union action space for database performance tuning
-and a rich observation model carrying query plans, metrics, and correctness info.
+Defines a discriminated-union action space for database performance tuning,
+a rich observation model carrying query plans, metrics, and correctness info,
+and a typed Reward model for structured reward metadata.
 """
 
 from typing import Any, Dict, List, Literal, Optional
 
 from openenv.core.env_server.types import Action, Observation
-from pydantic import Field
+from pydantic import BaseModel, Field
+
+
+# ---------------------------------------------------------------------------
+# Reward – typed breakdown of reward components
+# ---------------------------------------------------------------------------
+
+
+class DbaTunerReward(BaseModel):
+    """Typed reward breakdown for a single step.
+
+    This model provides structured access to individual reward components.
+    The scalar ``step_reward`` is also available on the Observation's
+    ``reward`` field for backward compatibility.
+    """
+
+    step_reward: float = Field(
+        default=0.0,
+        description="Raw step reward (may be negative — intentional RL signal)",
+    )
+    terminal_reward: Optional[float] = Field(
+        default=None,
+        description=(
+            "Final clamped reward [0.0, 1.0] when done=True. "
+            "None for non-terminal steps."
+        ),
+    )
+    task_solved: bool = Field(
+        default=False,
+        description=(
+            "Whether the task success condition was met "
+            "(cost_reduction_ratio > 0.3). Explain/get_stats bonuses alone "
+            "cannot set this to True."
+        ),
+    )
+    cost_reduction_ratio: float = Field(
+        default=0.0,
+        description="(baseline_plan_cost - current_plan_cost) / baseline_plan_cost",
+    )
+    index_penalty: float = Field(
+        default=0.0,
+        description="-0.02 × index_count",
+    )
+    storage_penalty: float = Field(
+        default=0.0,
+        description="-0.005 × storage_used_mb",
+    )
+    step_penalty: float = Field(
+        default=0.0,
+        description="-0.005 × step_count",
+    )
+    reasoning_bonus: float = Field(
+        default=0.0,
+        description="+0.1 one-time bonus (if earned this step)",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -26,23 +81,31 @@ class DbaTunerAction(Action):
     * ``add_index`` – CREATE INDEX on *table*.*column* (costs storage budget).
     * ``drop_index``– DROP INDEX by *index_name* (frees budget).
     * ``rewrite``   – Replace the current SQL with *new_sql*.
-    * ``create_materialized_view`` – For Level 7: create a materialized view using
-                      the *view_name* and *sql* fields (must be a CREATE TABLE ... AS SELECT).
-                      Then submit a rewrite() with a SELECT from that view.
+                      Not available on Level 4 (index-budget-only).
+    * ``create_materialized_view`` – For Level 7: create a materialized table
+                      using *view_name* and *sql* fields. The *sql* may be a
+                      bare SELECT (auto-wrapped) or a CREATE TABLE AS SELECT.
+                      Then submit a rewrite() with a SELECT from that table.
     * ``get_stats`` – Retrieve cardinality / distribution stats for *table*.
                       Earns a one-time +0.1 reasoning bonus (first call per episode).
-    * ``done``      – Terminate the episode explicitly when you believe the task is fully solved.
+    * ``done``      – Terminate the episode explicitly when you believe the
+                      task is fully solved.
 
     Reward Signal:
-        +CostReductionRatio      Proportional to (initial_cost − current_cost) / initial_cost.
+        +CostReductionRatio      Proportional to (baseline_cost − current_cost) / baseline_cost.
+                                 Based on EXPLAIN plan estimated rows (deterministic).
         +0.1                     One-time bonus for the first explain or get_stats call.
         −0.02 × index_count      Penalty per index created (over-indexing discouraged).
         −0.005 × storage_mb      Penalty per MB of index storage consumed.
-        −0.01 × step_count       Efficiency penalty for each step taken.
+        −0.005 × step_count      Efficiency penalty for each step taken.
 
-        Final episode score (done=True, is_correct=True): clamped to [0.0, 1.0].
-        Final episode score (done=True, is_correct=False): forced to 0.0.
+        Final episode score (done=True, task_solved=True): clamped to [0.0, 1.0].
+        Final episode score (done=True, task_solved=False): forced to 0.0.
         Intra-episode step rewards may be negative (RL signal).
+
+    Task Solved Condition:
+        cost_reduction_ratio > 0.3 (meaningful optimisation achieved).
+        Explain/get_stats bonuses alone cannot satisfy this condition.
     """
 
     action_type: Literal[
@@ -69,18 +132,22 @@ class DbaTunerAction(Action):
         description=(
             "Full replacement SQL query (rewrite only). "
             "May be a SELECT, CTE, window function, or CREATE TABLE AS SELECT. "
-            "Destructive DDL (DELETE, DROP TABLE, TRUNCATE, ALTER TABLE, UPDATE, INSERT) is blocked."
+            "Destructive DDL (DELETE, DROP TABLE, TRUNCATE, ALTER TABLE, UPDATE, INSERT) is blocked. "
+            "Not available on Level 4 (index-budget-only task)."
         ),
     )
 
     # --- create_materialized_view ---
     view_name: Optional[str] = Field(
         default=None,
-        description="Name of the materialized view to create (e.g. 'top_users_revenue')",
+        description="Name of the materialized table to create (e.g. 'top_users_revenue')",
     )
     sql: Optional[str] = Field(
         default=None,
-        description="The CREATE TABLE AS SELECT statement for the materialized view",
+        description=(
+            "SQL for the materialized view. Can be a bare SELECT (auto-wrapped as "
+            "CREATE TABLE <view_name> AS <sql>) or a full CREATE TABLE AS SELECT."
+        ),
     )
 
 
@@ -104,17 +171,20 @@ class DbaTunerObservation(Observation):
 
     7-Level Curriculum:
         L1 (Easy)   – Sequential scan on high-cardinality non-indexed column.
-        L2 (Medium) – Missing FK join index (Hash Join → Index Nested-Loop Join).
-        L3 (Medium) – Correlated subquery → CTE / window function.
-        L4 (Hard)   – Budget Challenge: 5 slow queries, 50 MB index limit.
+        L2 (Medium) – Large table point lookup (missing index on line_items.product_id).
+        L3 (Medium) – Redundant UNION ALL scans → single CASE WHEN GROUP BY.
+        L4 (Hard)   – Budget Challenge: 5 slow queries, 50 MB index limit (index-only, no rewrite).
         L5 (Hard)   – N+1 query pattern → single batch JOIN.
         L6 (Hard)   – Range scan optimisation on order_date.
         L7 (Hard)   – Materialised view for a 5-table aggregation join.
 
     Reward structure:
+        Reward = CostReductionRatio - 0.02×indexes - 0.005×storage_mb - 0.005×steps
+        Cost is measured via EXPLAIN plan estimated rows (deterministic, no timing).
         Step rewards are raw (may be negative — this is intentional RL signal).
-        The terminal reward (done=True) is clamped to [0.0, 1.0] for hackathon scoring.
-        Incorrect SQL (is_correct=False) forces terminal reward = 0.0.
+        Terminal reward (done=True, task_solved=True) is clamped to [0.0, 1.0].
+        Terminal reward (done=True, task_solved=False) is forced to 0.0.
+        task_solved requires cost_reduction_ratio > 0.3 (explain/get_stats alone insufficient).
     """
 
     # ── Query plan / stats output ────────────────────────────────────────
@@ -130,7 +200,7 @@ class DbaTunerObservation(Observation):
     )
     total_cost: float = Field(
         default=0.0,
-        description="Estimated planner cost (EXPLAIN output)",
+        description="Deterministic plan cost (estimated rows from EXPLAIN)",
     )
 
     # ── Storage budget ───────────────────────────────────────────────────
@@ -199,8 +269,8 @@ class DbaTunerObservation(Observation):
         default=0.0,
         description=(
             "Step reward. Intra-episode values may be negative (efficiency/penalty signal). "
-            "Terminal reward (done=True, is_correct=True) is clamped to [0.0, 1.0]. "
-            "Terminal reward (done=True, is_correct=False) is always 0.0."
+            "Terminal reward (done=True, task_solved=True) is clamped to [0.0, 1.0]. "
+            "Terminal reward (done=True, task_solved=False) is always 0.0."
         ),
     )
 
@@ -209,6 +279,7 @@ class DbaTunerObservation(Observation):
         default_factory=dict,
         description=(
             "Extra step metadata: step_count (int), episode_id (str), "
-            "cost_reduction_ratio (float), reasoning_bonus_paid (bool)."
+            "cost_reduction_ratio (float), reasoning_bonus_paid (bool), "
+            "task_solved (bool)."
         ),
     )

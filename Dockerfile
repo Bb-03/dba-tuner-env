@@ -32,7 +32,7 @@ RUN if ! command -v uv >/dev/null 2>&1; then \
     
 # Sync dependencies (creates /app/env/.venv)
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-editable
+    uv sync --no-editable
 
 # Final runtime stage
 FROM ${BASE_IMAGE}

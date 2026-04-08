@@ -12,7 +12,9 @@ MANDATORY environment variables:
 STDOUT FORMAT  (one line type per event, in order):
     [START] task=<name> env=dba_tuner_env model=<model>
     [STEP]  step=<n> action=<str> reward=<0.00> done=<true|false> error=<msg|null>
-    [END]   success=<true|false> steps=<n> score=<0.00> avg_reward=<0.00> rewards=<r1,r2,...>
+    [END]   success=<true|false> steps=<n> score=<0.00> rewards=<r1,r2,...>
+
+No extra lines on stdout.  Debug/error output goes to stderr only.
 """
 
 from __future__ import annotations
@@ -36,18 +38,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from openai import OpenAI
 
-from server.dba_tuner_env_environment import DbaTunerEnvironment
-from models import DbaTunerAction
+from server.dba_tuner_env_environment import DbaTunerEnvironment  # type: ignore
+from models import DbaTunerAction  # type: ignore
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-API_KEY      = os.getenv("HF_TOKEN") or os.getenv("API_KEY") or os.getenv("GROQ_API_KEY")
-
-# Detection: If key starts with gsk_, default to Groq endpoint
-is_groq = API_KEY.startswith("gsk_") if API_KEY else False
-DEFAULT_BASE_URL = "https://api.groq.com/openai/v1" if is_groq else "https://router.huggingface.co/v1"
-API_BASE_URL = os.getenv("API_BASE_URL", DEFAULT_BASE_URL)
-
-MODEL_NAME = os.getenv("MODEL_NAME", "llama-3.3-70b-versatile" if is_groq else "meta-llama/Llama-3.1-8B-Instruct")
+API_KEY      = os.getenv("HF_TOKEN")
+API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+MODEL_NAME   = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 
 BENCHMARK    = "dba_tuner_env"
 MAX_STEPS    = 25  # must cover the hardest scenario (Level 4: max_steps=25)
@@ -112,17 +109,20 @@ AVAILABLE ACTIONS (respond with ONLY a valid JSON object — no markdown, no exp
 
 5. Rewrite the SQL query (must produce IDENTICAL results to the original):
    {{"action_type": "rewrite", "new_sql": "SELECT ..."}}
+   NOTE: Not available on Level 4 (index-budget-only task).
 
    For Level 7 (Materialised View): first submit a CREATE TABLE AS SELECT to build
    the view, then submit a SELECT FROM that table — only the SELECT is graded.
 
 REWARD SIGNAL:
-  +CostReductionRatio   Proportional to EXPLAIN cost reduction (0.0 -> 1.0).
+  +CostReductionRatio   Proportional to EXPLAIN plan cost reduction (0.0 -> 1.0).
   +0.1                  One-time bonus for your FIRST explain or get_stats call.
   -0.02 x indexes       Penalty per index created (over-indexing is penalised).
   -0.005 x MB_used      Penalty per MB of index storage.
   -0.005 x step         Efficiency penalty per step -- solve it quickly!
   Terminal score        Clamped to [0.0, 1.0] when done=true.
+  IMPORTANT: You must achieve real cost reduction (>30%) for a non-zero terminal score.
+             Explain/get_stats bonuses alone will NOT earn a passing score.
 
 OPTIMAL STRATEGY:
   1. ALWAYS start with explain (earns reasoning bonus + reveals scan type).
@@ -145,8 +145,6 @@ def build_user_message(obs, step_num: int, prev_actions: list) -> str:
     """Construct the per-step observation message for the LLM."""
     history = ""
     if prev_actions:
-        # Sliding window: only send last 3 actions to control context size
-        # and prevent 413 Request Entity Too Large errors
         recent = prev_actions[-3:]
         offset = len(prev_actions) - len(recent)
         history = f"\nRecent actions (last {len(recent)} of {len(prev_actions)} total):\n" + "\n".join(
@@ -215,6 +213,8 @@ def format_action_str(action: DbaTunerAction) -> str:
     if action.action_type == "rewrite":
         preview = (action.new_sql or "")[:120].replace("\n", " ")
         return f"rewrite({preview}...)"
+    if action.action_type == "create_materialized_view":
+        return f"create_mv({action.view_name})"
     return f"{action.action_type}()"
 
 
@@ -262,7 +262,6 @@ def run_task(
                     err_str = str(e).lower()
                     if "402" in err_str or "payment" in err_str:
                         print(f"\n[FATAL] API Quota Exhausted (402): {e}", file=sys.stderr)
-                        print("TIP: Switch to Groq (free) by setting HF_TOKEN to a Groq API key.", file=sys.stderr)
                         sys.exit(1)
                     if "401" in err_str or "unauthorized" in err_str:
                         print(f"\n[FATAL] Invalid API Key (401): {e}", file=sys.stderr)
@@ -300,15 +299,15 @@ def run_task(
 
             print(
                 f"[STEP] step={step_num} action={action_str} "
-                f"reward={reward:.4f} done={str(done).lower()} error={error}",
+                f"reward={reward:.2f} done={str(done).lower()} error={error}",
                 flush=True,
             )
 
             if done:
                 break
 
-        # Episode score = max reward seen (terminal reward is already [0,1])
-        score = max(rewards) if rewards else 0.0
+        # Episode score = final terminal reward (the last reward when done=True)
+        score = rewards[-1] if rewards else 0.0
         avg_r = sum(rewards) / len(rewards) if rewards else 0.0
         success = score > 0.0
 
@@ -320,20 +319,19 @@ def run_task(
             rewards = [0.0]
             steps = 1
 
-    rewards_str = ",".join(f"{r:.4f}" for r in rewards)
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
     print(
         f"[END] success={str(success).lower()} steps={steps} "
-        f"score={score:.4f} avg_reward={avg_r:.4f} rewards={rewards_str}",
+        f"score={score:.2f} rewards={rewards_str}",
         flush=True,
     )
-    print()
     return score
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    """Run inference across all 7 tasks and print the overall average score."""
+    """Run inference across all 7 tasks."""
     if not API_KEY:
         print("ERROR: No API key found.", file=sys.stderr)
         print("  Set HF_TOKEN (or API_KEY) in your environment:", file=sys.stderr)
@@ -344,34 +342,16 @@ def main() -> None:
     llm_client = OpenAI(api_key=API_KEY, base_url=API_BASE_URL)
     env = DbaTunerEnvironment()
 
-    total_score = 0.0
-    results: list[dict] = []
-
     for task in TASKS:
-        score = run_task(
+        run_task(
             env=env,
             task_name=task["name"],
             level=task["level"],
             llm_client=llm_client,
             model_name=MODEL_NAME,
         )
-        total_score += score
-        results.append({"task": task["name"], "level": task["level"], "score": score})
 
     env.close()
-
-    avg_score = total_score / len(TASKS)
-
-    # Pretty summary table
-    print("=" * 55)
-    print(f"{'Task':<22} {'Level':>5}  {'Score':>7}")
-    print("-" * 55)
-    for r in results:
-        print(f"  {r['task']:<20} {r['level']:>5}  {r['score']:>7.4f}")
-    print("-" * 55)
-    print(f"  {'AVERAGE':<20} {'—':>5}  {avg_score:>7.4f}")
-    print("=" * 55)
-    print(f"\n[OVERALL] avg_score={avg_score:.4f} across {len(TASKS)} tasks")
 
 
 if __name__ == "__main__":

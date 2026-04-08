@@ -8,18 +8,22 @@ Key features
 * 100k-row e-commerce dataset with Pareto (α=1.1) skewed distributions
   – ~20% of users/products drive ~80% of activity, forcing the agent to use
     GetStats before blindly adding indexes.
+* Fully deterministic: reset(seed=N) reproduces identical datasets and baselines.
 * 7-level scenario registry (easy → expert).
 * Correctness checking via pandas DataFrame comparison (robust to column aliases).
 * Storage budget tracking (default 50 MB per episode).
 * 5-second SQL timeout to prevent cross-join hangs.
 * One-shot reasoning bonus: +0.1 awarded for the FIRST explain or get_stats call.
+* Deterministic reward: uses EXPLAIN plan estimated rows, not wall-clock timing.
 * Early termination when CostReductionRatio > 0.95 (efficiency signal).
 * Duplicate-rewrite detection (whitespace-normalised comparison → done + penalty).
-* Materialized view grader: CREATE TABLE AS is DDL-only (no correctness check);
-  the subsequent SELECT from the created table IS graded against the gold standard.
+* _task_solved gating: explain/get_stats bonuses alone cannot win an episode.
+  The agent must achieve cost_reduction_ratio > 0.3 for a non-zero terminal reward.
 * Step rewards are unclamped (may be negative — real RL signal).
 * Terminal reward (done=True) is clamped to [0.0, 1.0] for hackathon scoring.
-  If correctness fails, terminal reward is forced to 0.0.
+  If _task_solved is False or correctness fails, terminal reward is forced to 0.0.
+* Level 4 is index-budget-only; rewrite actions are explicitly rejected.
+* create_materialized_view is a first-class action using view_name + sql fields.
 """
 
 from __future__ import annotations
@@ -340,16 +344,45 @@ def _estimate_index_size_mb(
 
 
 def _parse_explain_cost(explain_text: str) -> float:
-    """Extract total execution time from EXPLAIN ANALYZE timing values only.
+    r"""Extract total execution time from EXPLAIN ANALYZE timing values only.
 
     Uses regex (\d+\.\d+)s to capture only seconds-denominated values,
     ignoring row counts, cardinality estimates, and other numeric noise.
+    NOTE: Used only for display purposes; reward uses _get_plan_cost instead.
     """
     total = 0.0
     for line in explain_text.split("\n"):
         for n in re.findall(r"(\d+\.\d+)s", line):
             total += float(n)
     return total if total > 0 else 0.0001
+
+
+def _get_plan_cost(conn: duckdb.DuckDBPyConnection, sql: str) -> float:
+    """Deterministic cost proxy from EXPLAIN (no execution).
+
+    Parses the query plan and sums estimated row counts across all operator
+    nodes.  This gives a stable, reproducible cost signal that does not
+    depend on wall-clock timing or CPU load.
+
+    Returns a positive float (minimum 1.0).
+    """
+    try:
+        rows = conn.execute(f"EXPLAIN {sql}").fetchall()
+        plan_text = "\n".join(str(r) for r in rows)
+
+        # Extract estimated row counts from plan nodes
+        # DuckDB EXPLAIN output contains lines like "~100000 Rows" or "EC: 100000"
+        total_rows = 0.0
+        for line in plan_text.split("\n"):
+            # Match patterns like "~12345" or "EC: 12345" or "12345 Rows"
+            for m in re.findall(r"(?:~|EC:\s*)(\d+)", line):
+                total_rows += float(m)
+            for m in re.findall(r"(\d+)\s*[Rr]ows?", line):
+                total_rows += float(m)
+
+        return max(1.0, total_rows)
+    except Exception:
+        return 1.0
 
 
 def _shrink_plan(raw_plan: str, top_n: int = 5) -> str:
@@ -419,22 +452,8 @@ def _shrink_plan(raw_plan: str, top_n: int = 5) -> str:
     return "\n".join(result_lines)
 
 
-def _get_explain_cost(
-    conn: duckdb.DuckDBPyConnection, sql: str
-) -> float:
-    """Get deterministic estimated cost from EXPLAIN ANALYZE (averaged).
-
-    Runs EXPLAIN ANALYZE 3 times and averages to smooth out sub-millisecond
-    timing jitter that causes reward signal noise.
-    """
-    try:
-        samples = []
-        for _ in range(3):
-            rows = conn.execute(f"EXPLAIN ANALYZE {sql}").fetchall()
-            samples.append(_parse_explain_cost("\n".join(str(r) for r in rows)))
-        return sum(samples) / len(samples) if samples else 0.0001
-    except Exception:
-        return 0.0001
+# NOTE: _get_explain_cost has been removed. Reward computation now uses
+# _get_plan_cost (deterministic EXPLAIN-based, no timing) instead.
 
 
 def _extract_create_table_name(sql: str) -> Optional[str]:
@@ -460,13 +479,18 @@ class DbaTunerEnvironment(Environment):
 
     Reward design
     -------------
+    * Cost measured via EXPLAIN plan estimated rows (deterministic, no timing).
     * Step rewards are raw / unclamped (may be negative — provides RL signal).
-    * Terminal reward (done=True, is_correct=True):
+    * Terminal reward (done=True, task_solved=True):
           max(0.0, min(1.0, best_reward_seen_this_episode))
-    * Terminal reward (done=True, is_correct=False): forced to 0.0.
+    * Terminal reward (done=True, task_solved=False): forced to 0.0.
+    * task_solved requires cost_reduction_ratio > 0.3 (meaningful improvement).
     * One-shot reasoning bonus (+0.1) on the first explain or get_stats call.
+    * Explain/get_stats bonuses alone CANNOT set task_solved.
     * Duplicate rewrite detection (whitespace-normalised): done=True, reward=-0.1.
     * Early success termination when CostReductionRatio > 0.95.
+    * Level 4 is index-budget-only; rewrite actions are rejected.
+    * Fully deterministic: reset(seed=N) reproduces identical datasets.
     """
 
     SUPPORTS_CONCURRENT_SESSIONS: bool = True
@@ -497,6 +521,13 @@ class DbaTunerEnvironment(Environment):
         self._best_reward: float = 0.0           # best intra-episode step reward
         self._cost_reduction_ratio: float = 0.0  # last computed ratio (for metadata)
         self._episode_failed: bool = False        # True when episode ends due to incorrect SQL
+        self._task_solved: bool = False           # True only when real task success condition met
+
+        # Deterministic cost baseline (from EXPLAIN estimated rows, not timing)
+        self._baseline_plan_cost: float = 1.0
+
+        # NumPy RNG for deterministic data generation
+        self._rng: Optional[np.random.Generator] = None
 
         # Reasoning bonus (one-shot: fires on the first explain or get_stats call)
         self._reasoning_bonus_paid: bool = False
@@ -531,9 +562,10 @@ class DbaTunerEnvironment(Environment):
             episode_id: Optional episode identifier.
             level:      Specific scenario level (1–7).  None → random pick.
         """
+        # Initialize RNG — use new-style Generator for full reproducibility
+        self._rng = np.random.default_rng(seed) if seed is not None else np.random.default_rng()
         if seed is not None:
             random.seed(seed)
-            np.random.seed(seed)
 
         # Close previous connection
         if self._conn is not None:
@@ -556,18 +588,20 @@ class DbaTunerEnvironment(Environment):
         self._best_reward = 0.0
         self._cost_reduction_ratio = 0.0
         self._episode_failed = False
+        self._task_solved = False
         self._reasoning_bonus_paid = False
+        self._baseline_plan_cost = 1.0
         self._mv_created = False
         self._mv_table_name = ""
 
-        # Generate fresh dataset
+        # Generate fresh dataset deterministically from seed
         self._generate_data()
 
         # Pick scenario
         if level is not None and 1 <= level <= len(SCENARIOS):
             self._scenario = SCENARIOS[level - 1]
         else:
-            self._scenario = random.choice(SCENARIOS)
+            self._scenario = SCENARIOS[self._rng.integers(0, len(SCENARIOS))]
 
         self._storage_budget_mb = self._scenario["storage_budget_mb"]
         self._max_steps = self._scenario["max_steps"]
@@ -583,8 +617,8 @@ class DbaTunerEnvironment(Environment):
                 _, lat = _execute_with_timeout(self._conn, q)
                 self._multi_baselines.append(lat)
             self._baseline_latency = sum(self._multi_baselines)
-            self._baseline_cost = sum(
-                _get_explain_cost(self._conn, q) for q in self._multi_queries
+            self._baseline_plan_cost = sum(
+                _get_plan_cost(self._conn, q) for q in self._multi_queries
             )
 
         elif lv == 5:
@@ -597,8 +631,8 @@ class DbaTunerEnvironment(Environment):
                 _, lat = _execute_with_timeout(self._conn, q)
                 total_lat += lat
             self._baseline_latency = total_lat
-            self._baseline_cost = sum(
-                _get_explain_cost(self._conn, self._n_plus_one_query(uid))
+            self._baseline_plan_cost = sum(
+                _get_plan_cost(self._conn, self._n_plus_one_query(uid))
                 for uid in self._n_plus_one_user_ids
             )
 
@@ -608,15 +642,10 @@ class DbaTunerEnvironment(Environment):
             try:
                 _, lat = _execute_with_timeout(self._conn, self._current_sql)
                 self._baseline_latency = lat
-                explain_rows = self._conn.execute(
-                    f"EXPLAIN ANALYZE {self._current_sql}"
-                ).fetchall()
-                self._baseline_cost = _parse_explain_cost(
-                    "\n".join(str(r) for r in explain_rows)
-                )
+                self._baseline_plan_cost = _get_plan_cost(self._conn, self._current_sql)
             except Exception:
                 self._baseline_latency = 100.0
-                self._baseline_cost = 100.0
+                self._baseline_plan_cost = 100.0
 
         return DbaTunerObservation(
             query_plan="Environment reset. Use 'explain' to see the query plan, 'get_stats' to analyse table statistics.",
@@ -682,36 +711,38 @@ class DbaTunerEnvironment(Environment):
         except Exception:
             pass
 
-        if self._state.step_count >= self._max_steps:
+        if self._state.step_count > self._max_steps:
             self._done = True
-            # Return the best episode reward on max-steps termination
+            # Return terminal reward on max-steps termination
+            terminal_r = max(0.0, min(1.0, self._best_reward)) if self._task_solved else 0.0
             return self._make_obs(
                 error_message="Max steps reached.",
-                reward=0.0,
+                reward=terminal_r,
                 done=True,
             )
 
         try:
             atype = action.action_type
             if atype == "explain":
-                return self._handle_explain()
+                obs = self._handle_explain()
             elif atype == "add_index":
-                return self._handle_add_index(action.table, action.column)
+                obs = self._handle_add_index(action.table, action.column)
             elif atype == "drop_index":
-                return self._handle_drop_index(action.index_name)
+                obs = self._handle_drop_index(action.index_name)
             elif atype == "rewrite":
-                return self._handle_rewrite(action.new_sql)
+                obs = self._handle_rewrite(action.new_sql)
             elif atype == "get_stats":
-                return self._handle_get_stats(action.table)
+                obs = self._handle_get_stats(action.table)
             elif atype == "create_materialized_view":
-                return self._handle_rewrite(action.sql or "")
+                obs = self._handle_create_materialized_view(action.view_name, action.sql)
             elif atype == "done":
                 self._done = True
+                terminal_r = max(0.0, min(1.0, self._best_reward)) if self._task_solved else 0.0
                 return self._make_obs(
-                    query_plan="Agent explicitly called done.", 
-                    reward=self._best_reward, 
+                    query_plan="Agent explicitly called done.",
+                    reward=terminal_r,
                     is_correct=not self._episode_failed,
-                    done=True
+                    done=True,
                 )
             else:
                 return self._make_obs(
@@ -719,9 +750,18 @@ class DbaTunerEnvironment(Environment):
                     reward=0.0,
                 )
         except TimeoutError as e:
-            return self._make_obs(error_message=f"Timeout: {e}", reward=-0.05)
+            obs = self._make_obs(error_message=f"Timeout: {e}", reward=-0.05)
         except Exception as e:
-            return self._make_obs(error_message=f"Error: {e}", reward=0.0)
+            obs = self._make_obs(error_message=f"Error: {e}", reward=0.0)
+
+        # ── Post-action max-step check (agent gets full max_steps actions) ─
+        if self._state.step_count >= self._max_steps and not self._done:
+            self._done = True
+            terminal_r = max(0.0, min(1.0, self._best_reward)) if self._task_solved else 0.0
+            obs.done = True
+            obs.reward = round(terminal_r, 6)
+
+        return obs
 
     # ── Action handlers ───────────────────────────────────────────────────
 
@@ -882,6 +922,16 @@ class DbaTunerEnvironment(Environment):
                 )
 
         lv = self._scenario["level"]
+
+        # ── Level 4: index-budget-only task, rewrite not applicable ────────
+        if lv == 4:
+            return self._make_obs(
+                error_message=(
+                    "Level 4 is an index-budget-only task. "
+                    "Rewrite is not applicable — use add_index to optimise queries."
+                ),
+                reward=0.0,
+            )
 
         # ── Materialised-view DDL path (CREATE TABLE AS) ──────────────────
         is_create_table_as = (
@@ -1067,13 +1117,76 @@ class DbaTunerEnvironment(Environment):
                 error_message=f"Failed to get stats: {e}", reward=0.0
             )
 
+    def _handle_create_materialized_view(
+        self, view_name: Optional[str], sql: Optional[str]
+    ) -> DbaTunerObservation:
+        """Create a materialized view (CREATE TABLE AS SELECT).
+
+        This is a first-class action for Level 7.  The agent provides a
+        view_name and a SQL statement.  If the SQL is a bare SELECT, it is
+        wrapped as CREATE TABLE {view_name} AS {sql}.
+        """
+        if not view_name or not sql or not sql.strip():
+            return self._make_obs(
+                error_message=(
+                    "create_materialized_view requires 'view_name' and 'sql' fields."
+                ),
+                reward=0.0,
+            )
+
+        view_name = self._sanitise_identifier(view_name)
+        sql_stripped = sql.strip()
+        sql_upper = sql_stripped.upper()
+
+        # If agent provided a bare SELECT, wrap it
+        if sql_upper.startswith("SELECT"):
+            create_sql = f"CREATE TABLE {view_name} AS {sql_stripped}"
+        elif sql_upper.startswith("CREATE TABLE"):
+            create_sql = sql_stripped
+        else:
+            return self._make_obs(
+                error_message=(
+                    "sql must be a SELECT or CREATE TABLE AS SELECT statement."
+                ),
+                reward=0.0,
+            )
+
+        try:
+            _execute_with_timeout(self._conn, create_sql)
+        except Exception as e:
+            return self._make_obs(
+                error_message=f"CREATE TABLE AS failed: {e}", reward=0.0
+            )
+
+        self._mv_created = True
+        self._mv_table_name = view_name
+
+        bonus = 0.0
+        if not self._reasoning_bonus_paid:
+            bonus = 0.1
+            self._reasoning_bonus_paid = True
+
+        ddl_reward = 0.15 + bonus
+        self._best_reward = max(self._best_reward, ddl_reward)
+
+        return self._make_obs(
+            query_plan=(
+                f"Materialised table '{view_name}' created successfully. "
+                f"Now issue a rewrite with a SELECT query that reads from "
+                f"'{view_name}' — that SELECT will be graded against the "
+                f"gold standard result set."
+            ),
+            reward=ddl_reward,
+            is_correct=True,
+        )
+
     # ── Reward calculation ────────────────────────────────────────────────
 
     def _calculate_reward(self) -> float:
-        """Compute the raw (unclamped) step reward.
+        """Compute the raw (unclamped) step reward using deterministic plan cost.
 
         Formula:
-            CostReductionRatio
+            CostReductionRatio  (from EXPLAIN estimated rows, not timing)
             - 0.02  x index_count
             - 0.005 x storage_used_mb
             - 0.005 x step_count
@@ -1082,6 +1195,9 @@ class DbaTunerEnvironment(Environment):
         *increase* in cost does not produce a strongly negative base.
         Penalties may still push the final value negative -- this is intentional
         RL signal.  Terminal clamping to [0.0, 1.0] is applied in _make_obs.
+
+        Sets _task_solved = True when cost_reduction_ratio > 0.3 (meaningful
+        improvement beyond what explain/get_stats bonuses can provide).
         """
         lv = self._scenario["level"]
         self._cost_reduction_ratio = 0.0
@@ -1089,10 +1205,10 @@ class DbaTunerEnvironment(Environment):
         try:
             if lv == 4:
                 current_cost = sum(
-                    _get_explain_cost(self._conn, q)
+                    _get_plan_cost(self._conn, q)
                     for q in self._multi_queries
                 )
-                ratio = 1.0 - (current_cost / max(self._baseline_cost, 0.001))
+                ratio = 1.0 - (current_cost / max(self._baseline_plan_cost, 1.0))
             elif lv == 5 and self._current_sql == "N_PLUS_ONE":
                 ratio = 0.0  # no improvement yet
             else:
@@ -1103,8 +1219,8 @@ class DbaTunerEnvironment(Environment):
                 ):
                     ratio = 0.0
                 else:
-                    current_cost = _get_explain_cost(self._conn, self._current_sql)
-                    ratio = 1.0 - (current_cost / max(self._baseline_cost, 0.001))
+                    current_cost = _get_plan_cost(self._conn, self._current_sql)
+                    ratio = 1.0 - (current_cost / max(self._baseline_plan_cost, 1.0))
         except Exception:
             ratio = 0.0
 
@@ -1112,9 +1228,14 @@ class DbaTunerEnvironment(Environment):
         ratio = max(0.0, min(1.0, ratio))
         self._cost_reduction_ratio = ratio
 
+        # Mark task as solved when meaningful improvement is achieved
+        if ratio > 0.3:
+            self._task_solved = True
+
         # Early success termination
         if ratio > 0.95:
             self._done = True
+            self._task_solved = True
 
         idx_count = len(self._active_indexes)
         mb_used = self._storage_used_mb
@@ -1126,8 +1247,13 @@ class DbaTunerEnvironment(Environment):
     # ── Data generation ───────────────────────────────────────────────────
 
     def _generate_data(self) -> None:
-        """Generate the 100k-row e-commerce dataset with Pareto (α=1.1) skew."""
+        """Generate the 100k-row e-commerce dataset with Pareto (α=1.1) skew.
+
+        All random data is generated via self._rng (numpy Generator) for full
+        seed-based reproducibility.  No DuckDB random() calls are used.
+        """
         conn = self._conn
+        rng = self._rng
         ALPHA = 1.1  # Aggressive skew: ~20% of keys → ~80% of rows
 
         # ── Users (100k) ─────────────────────────────────────────────────
@@ -1190,10 +1316,15 @@ class DbaTunerEnvironment(Environment):
         num_orders = 100_000
         statuses = ["pending", "completed", "cancelled", "shipped", "returned"]
 
-        raw_u = np.random.pareto(a=ALPHA, size=num_orders) + 1.0
+        raw_u = rng.pareto(a=ALPHA, size=num_orders) + 1.0
         user_ids = np.clip(
             (raw_u / raw_u.max() * num_users).astype(int), 1, num_users
         )
+
+        # Generate all columns deterministically in Python
+        order_day_offsets = rng.integers(0, 365, size=num_orders)
+        order_status_idx = rng.integers(0, len(statuses), size=num_orders)
+        order_amounts = np.round(10.0 + rng.random(num_orders) * 990.0, 2)
 
         conn.execute("""
             CREATE TABLE orders (
@@ -1204,35 +1335,50 @@ class DbaTunerEnvironment(Environment):
                 total_amount DOUBLE
             )
         """)
-        conn.execute("CREATE TEMPORARY TABLE _tmp_uids (uid INTEGER)")
-        for start in range(0, num_orders, 10_000):
-            end = min(start + 10_000, num_orders)
-            vals = ", ".join(f"({int(u)})" for u in user_ids[start:end])
-            conn.execute(f"INSERT INTO _tmp_uids SELECT * FROM (VALUES {vals})")
 
-        conn.execute(f"""
+        # Build orders data as list of tuples and bulk insert
+        orders_data = []
+        for i in range(num_orders):
+            orders_data.append((
+                i + 1,
+                int(user_ids[i]),
+                f"2023-01-01",  # placeholder, offset applied below
+                statuses[int(order_status_idx[i])],
+                float(order_amounts[i]),
+            ))
+
+        # Use batch insert via temp table for speed
+        conn.execute("CREATE TEMPORARY TABLE _tmp_orders (oid INTEGER, uid INTEGER, day_offset INTEGER, status VARCHAR, amount DOUBLE)")
+        batch_size = 10_000
+        for start in range(0, num_orders, batch_size):
+            end = min(start + batch_size, num_orders)
+            vals = ", ".join(
+                f"({i+1}, {int(user_ids[i])}, {int(order_day_offsets[i])}, '{statuses[int(order_status_idx[i])]}', {float(order_amounts[i])})"
+                for i in range(start, end)
+            )
+            conn.execute(f"INSERT INTO _tmp_orders SELECT * FROM (VALUES {vals})")
+
+        conn.execute("""
             INSERT INTO orders
-            SELECT
-                ROW_NUMBER() OVER () AS order_id,
-                uid AS user_id,
-                DATE '2023-01-01' + INTERVAL (
-                    CAST(FLOOR(random() * 365) AS INTEGER)
-                ) DAY AS order_date,
-                CASE CAST(FLOOR(random() * {len(statuses)}) AS INTEGER)
-                    {" ".join(f"WHEN {j} THEN '{s}'" for j, s in enumerate(statuses))}
-                END AS status,
-                ROUND(10.0 + random() * 990.0, 2) AS total_amount
-            FROM _tmp_uids
+            SELECT oid AS order_id, uid AS user_id,
+                   DATE '2023-01-01' + INTERVAL (day_offset) DAY AS order_date,
+                   status, amount AS total_amount
+            FROM _tmp_orders
         """)
-        conn.execute("DROP TABLE _tmp_uids")
+        conn.execute("DROP TABLE _tmp_orders")
 
         # ── LineItems (300k) with Pareto-skewed product_id ────────────────
         num_line_items = 300_000
 
-        raw_p = np.random.pareto(a=ALPHA, size=num_line_items) + 1.0
+        raw_p = rng.pareto(a=ALPHA, size=num_line_items) + 1.0
         product_ids = np.clip(
             (raw_p / raw_p.max() * num_products).astype(int), 1, num_products
         )
+
+        # Generate all columns deterministically
+        li_order_ids = rng.integers(1, num_orders + 1, size=num_line_items)
+        li_quantities = rng.integers(1, 11, size=num_line_items)
+        li_unit_prices = np.round(5.0 + rng.random(num_line_items) * 200.0, 2)
 
         conn.execute("""
             CREATE TABLE line_items (
@@ -1243,23 +1389,22 @@ class DbaTunerEnvironment(Environment):
                 unit_price   DOUBLE
             )
         """)
-        conn.execute("CREATE TEMPORARY TABLE _tmp_pids (pid INTEGER)")
-        for start in range(0, num_line_items, 10_000):
-            end = min(start + 10_000, num_line_items)
-            vals = ", ".join(f"({int(p)})" for p in product_ids[start:end])
-            conn.execute(f"INSERT INTO _tmp_pids SELECT * FROM (VALUES {vals})")
+        conn.execute("CREATE TEMPORARY TABLE _tmp_li (lid INTEGER, oid INTEGER, pid INTEGER, qty INTEGER, price DOUBLE)")
+        for start in range(0, num_line_items, batch_size):
+            end = min(start + batch_size, num_line_items)
+            vals = ", ".join(
+                f"({i+1}, {int(li_order_ids[i])}, {int(product_ids[i])}, {int(li_quantities[i])}, {float(li_unit_prices[i])})"
+                for i in range(start, end)
+            )
+            conn.execute(f"INSERT INTO _tmp_li SELECT * FROM (VALUES {vals})")
 
-        conn.execute(f"""
+        conn.execute("""
             INSERT INTO line_items
-            SELECT
-                ROW_NUMBER() OVER () AS line_item_id,
-                1 + CAST(FLOOR(random() * {num_orders}) AS INTEGER) AS order_id,
-                pid AS product_id,
-                1 + CAST(FLOOR(random() * 10) AS INTEGER) AS quantity,
-                ROUND(5.0 + random() * 200.0, 2) AS unit_price
-            FROM _tmp_pids
+            SELECT lid AS line_item_id, oid AS order_id, pid AS product_id,
+                   qty AS quantity, price AS unit_price
+            FROM _tmp_li
         """)
-        conn.execute("DROP TABLE _tmp_pids")
+        conn.execute("DROP TABLE _tmp_li")
 
     # ── Helpers ───────────────────────────────────────────────────────────
 
@@ -1293,24 +1438,27 @@ class DbaTunerEnvironment(Environment):
         Reward clamping policy:
         - Non-terminal steps: raw reward passed through (may be negative).
         - Terminal steps (done=True):
-            * is_correct=False → reward = 0.0  (hard failure)
-            * is_correct=True  → reward = max(0.0, min(1.0, best_reward_seen))
+            * is_correct=False or _episode_failed → reward = 0.0
+            * _task_solved=True  → reward = max(0.0, min(1.0, best_reward_seen))
+            * _task_solved=False → reward = 0.0  (explain/get_stats alone cannot win)
         """
         if done is None:
             done = self._done
 
-        # Only track best reward while episode is still active (no re-tracking after done)
+        # Only track best reward while episode is still active
         if not self._done or not done:
             self._best_reward = max(self._best_reward, reward)
 
-        # Terminal reward clamping (hackathon scoring requirement)
+        # Terminal reward clamping
         if done:
             if not is_correct or self._episode_failed:
                 reward = 0.0
-            else:
+            elif self._task_solved:
                 reward = max(0.0, min(1.0, self._best_reward))
+            else:
+                reward = 0.0
 
-        # Measure current latency for the observation
+        # Measure current latency/cost for the observation
         latency_ms = 0.0
         total_cost = 0.0
         lv = self._scenario.get("level", 1)
@@ -1322,23 +1470,23 @@ class DbaTunerEnvironment(Environment):
                         _, lat = _execute_with_timeout(self._conn, q)
                         latency_ms += lat
                     total_cost = sum(
-                        _get_explain_cost(self._conn, q) for q in self._multi_queries
+                        _get_plan_cost(self._conn, q) for q in self._multi_queries
                     )
                 elif lv == 5 and self._current_sql == "N_PLUS_ONE":
                     for uid in self._n_plus_one_user_ids:
                         _, lat = _execute_with_timeout(self._conn, self._n_plus_one_query(uid))
                         latency_ms += lat
                     total_cost = sum(
-                        _get_explain_cost(self._conn, self._n_plus_one_query(uid))
+                        _get_plan_cost(self._conn, self._n_plus_one_query(uid))
                         for uid in self._n_plus_one_user_ids
                     )
                 elif self._current_sql and self._current_sql not in ("N_PLUS_ONE", "MULTI_QUERY"):
                     if self._current_sql.strip().upper().startswith("CREATE TABLE"):
                         latency_ms = 0.0
-                        total_cost = self._baseline_cost
+                        total_cost = self._baseline_plan_cost
                     else:
                         _, latency_ms = _execute_with_timeout(self._conn, self._current_sql)
-                        total_cost = _get_explain_cost(self._conn, self._current_sql)
+                        total_cost = _get_plan_cost(self._conn, self._current_sql)
             except Exception:
                 pass
 
@@ -1364,6 +1512,7 @@ class DbaTunerEnvironment(Environment):
                 "episode_id": self._state.episode_id,
                 "cost_reduction_ratio": round(self._cost_reduction_ratio, 4),
                 "reasoning_bonus_paid": self._reasoning_bonus_paid,
+                "task_solved": self._task_solved,
                 "mv_created": self._mv_created,
                 "mv_table_name": self._mv_table_name,
             },
