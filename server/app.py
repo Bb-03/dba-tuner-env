@@ -67,6 +67,15 @@ app = create_app(
     max_concurrent_envs=4,  # allow concurrent WebSocket sessions
 )
 
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 def main(host: str = "0.0.0.0", port: int = 8000):
     """Entry point for direct execution via uv run or python -m."""
