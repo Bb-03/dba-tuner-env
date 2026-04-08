@@ -113,7 +113,7 @@ class DbaTunerObservation(Observation):
         Cost is measured via 0-compute tree node counting.
         Step rewards are raw (may be negative — this is intentional RL signal).
         Terminal reward (done=True, task_solved=True) is clamped to [0.0, 1.0].
-        task_solved requires cost_reduction_ratio > 0.3.
+        task_solved requires cost_reduction_ratio > 0.15.
     """
 
     # ── Query plan / stats output ────────────────────────────────────────
