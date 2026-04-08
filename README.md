@@ -18,8 +18,8 @@ tags:
 # DBA Tuner Env 🗄️
 
 **An AI agent acts as a Database Administrator (DBA) to optimise DuckDB query
-performance across 7 difficulty levels — from simple index creation to
-materialised views, N+1 pattern fixes, and multi-query budget challenges.**
+performance across 3 difficulty levels — from simple index creation to
+join optimisation and selective range scans.**
 
 ## Overview
 
@@ -28,7 +28,7 @@ materialised views, N+1 pattern fixes, and multi-query budget challenges.**
 | **Domain** | Database performance, SQL optimisation |
 | **Backend** | DuckDB (in-memory, `:memory:`) |
 | **Dataset** | 100k-row Pareto-skewed (α=1.1) e-commerce data |
-| **Levels** | 7 (Easy → Expert) |
+| **Tasks** | 3 (Easy → Hard) |
 | **Reward** | Continuous [0.0 → 1.0], deterministic plan-cost-based |
 | **Reproducible** | `reset(seed=N)` produces identical datasets every time |
 | **Hardware** | 8 GB RAM / 2 vCPU |
@@ -76,17 +76,13 @@ line_items (300 000 rows)  line_item_id, order_id, product_id★, quantity, unit
 
 ---
 
-## 7-Level Curriculum
+## 3-Task Curriculum
 
-| Level | Name | Goal |
-|-------|------|------|
-| 1 | Sequential Scan | Add index on `orders.user_id` |
-| 2 | Large Table Point Lookup | Index `line_items.product_id` for point lookups |
-| 3 | Redundant Scan Consolidation | UNION ALL → single CASE WHEN GROUP BY |
-| 4 | Budget Challenge | Optimise 5 queries within 50 MB index limit (index-only, no rewrite) |
-| 5 | N+1 Fix | Collapse per-row SELECTs into a single batch JOIN |
-| 6 | Range Scan | Index `orders.order_date` for BETWEEN queries |
-| 7 | Materialised View | CREATE TABLE AS → SELECT from it (5-table join) |
+| Task | Name | Goal |
+|------|------|------|
+| 1 | Point Lookup | Add index on `orders.user_id` |
+| 2 | Join Optimisation | Add indexes on `orders.user_id` + `line_items.order_id` |
+| 3 | Range Scan | Add index on `orders.order_date` for BETWEEN queries |
 
 ---
 
@@ -97,8 +93,6 @@ line_items (300 000 rows)  line_item_id, order_id, product_id★, quantity, unit
 {"action_type": "get_stats",  "table": "orders"}
 {"action_type": "add_index",  "table": "orders",  "column": "user_id"}
 {"action_type": "drop_index", "index_name": "idx_orders_user_id"}
-{"action_type": "rewrite",    "new_sql": "SELECT ..."}
-{"action_type": "create_materialized_view", "view_name": "top_users", "sql": "SELECT ..."}
 {"action_type": "done"}
 ```
 
@@ -116,7 +110,7 @@ Reward = CostReductionRatio                     # (baseline_cost - current_cost)
 Cost is measured via EXPLAIN plan estimated rows (deterministic, no timing).
 
 Terminal score (done=True):
-  task_solved=True  → max(0.0, min(1.0, best_step_reward))
+  task_solved=True  → max(0.0, min(1.0, computed_reward))
   task_solved=False → 0.0  (explain/get_stats bonuses alone cannot win)
   is_correct=False  → 0.0  (wrong results = zero)
 
@@ -158,7 +152,7 @@ uv sync
 # Run the HTTP server
 uvicorn server.app:app --reload --host 0.0.0.0 --port 8000
 
-# Run inference against all 7 tasks
+# Run inference against all 3 tasks
 export HF_TOKEN="hf_..."
 python inference.py
 
@@ -188,7 +182,7 @@ The `[END]` score is the final terminal reward from the environment.
 ```
 dba-tuner-env/
 ├── models.py                          # Action + Observation + Reward Pydantic models
-├── inference.py                       # LLM inference script (all 7 tasks)
+├── inference.py                       # LLM inference script (all 3 tasks)
 ├── client.py                          # WebSocket client (DbaTunerEnv)
 ├── openenv.yaml                       # OpenEnv manifest
 ├── pyproject.toml                     # Package metadata

@@ -1,8 +1,8 @@
 """
 DBA Tuner Env - Inference Script
 ===================================
-Demonstrates a full "Thinking Trajectory" across all 7 task levels:
-    explain → get_stats → add_index / rewrite → verify reward
+Demonstrates a full "Thinking Trajectory" across all 3 tasks:
+    explain → get_stats → add_index → done
 
 MANDATORY environment variables:
     HF_TOKEN        Your Hugging Face API key (or any OpenAI-compatible key).
@@ -47,17 +47,13 @@ API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME   = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 
 BENCHMARK    = "dba_tuner_env"
-MAX_STEPS    = 25  # must cover the hardest scenario (Level 4: max_steps=25)
+MAX_STEPS    = 15  # covers all 3 tasks
 
-# All 7 tasks (easy → expert)
+# All 3 tasks (easy → hard)
 TASKS = [
     {"name": "simple_index",      "level": 1, "difficulty": "easy"},
     {"name": "join_optimization", "level": 2, "difficulty": "medium"},
-    {"name": "subquery_rewrite",  "level": 3, "difficulty": "medium"},
-    {"name": "budget_challenge",  "level": 4, "difficulty": "hard"},
-    {"name": "n_plus_one_fix",    "level": 5, "difficulty": "hard"},
-    {"name": "range_scan",        "level": 6, "difficulty": "hard"},
-    {"name": "materialized_view", "level": 7, "difficulty": "hard"},
+    {"name": "range_scan",        "level": 3, "difficulty": "hard"},
 ]
 
 # ── Full database schema (injected into every LLM prompt) ─────────────────────
@@ -88,7 +84,7 @@ DATABASE_SCHEMA = textwrap.dedent("""\
 # ── System Prompt ──────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = textwrap.dedent(f"""\
 You are an expert Database Administrator (DBA) optimising a DuckDB database for performance.
-Your goal is to reduce query latency by adding indexes and/or rewriting queries.
+Your goal is to reduce query cost by adding targeted indexes.
 
 {DATABASE_SCHEMA}
 
@@ -107,12 +103,8 @@ AVAILABLE ACTIONS (respond with ONLY a valid JSON object — no markdown, no exp
 4. Drop an existing index (reclaims storage):
    {{"action_type": "drop_index", "index_name": "INDEX_NAME"}}
 
-5. Rewrite the SQL query (must produce IDENTICAL results to the original):
-   {{"action_type": "rewrite", "new_sql": "SELECT ..."}}
-   NOTE: Not available on Level 4 (index-budget-only task).
-
-   For Level 7 (Materialised View): first submit a CREATE TABLE AS SELECT to build
-   the view, then submit a SELECT FROM that table — only the SELECT is graded.
+5. Signal that the task is solved (terminates the episode):
+   {{"action_type": "done"}}
 
 REWARD SIGNAL:
   +CostReductionRatio   Proportional to EXPLAIN plan cost reduction (0.0 -> 1.0).
@@ -126,15 +118,11 @@ REWARD SIGNAL:
 
 OPTIMAL STRATEGY:
   1. ALWAYS start with explain (earns reasoning bonus + reveals scan type).
-  2. Use get_stats on the WHERE / JOIN columns to confirm high selectivity.
-  3. Add at most 2-3 targeted indexes -- more is penalised.
-  4. Only rewrite SQL when the scenario explicitly requires it (UNION ALL, N+1).
-  5. For Level 3 (UNION ALL): consolidate multiple scans into a single CASE WHEN GROUP BY.
-  6. For N+1 (Level 5): rewrite using WHERE user_id IN (...) batch join.
-  7. For Budget Challenge (Level 4): index orders.user_id and line_items.product_id first.
-  8. Stop early -- the environment will end successfully when cost drops > 95%.
+  2. Use get_stats on the WHERE / JOIN columns to confirm selectivity.
+  3. Add at most 1-2 targeted indexes — more is penalised.
+  4. Call done when cost reduction is high to lock in the terminal reward.
 
-IMPORTANT: First, think step-by-step in a <thought>...</thought> block about your observations and strategy. Then, output exactly ONE JSON action object.
+IMPORTANT: Respond with exactly ONE valid JSON action object in your reply. Do NOT output any other text or markdown code blocks.
 DANGER: Do NOT repeat any action (like explain or get_stats) twice in a row with identical parameters. Each step costs efficiency bonus, and IDENTICAL CONSECUTIVE actions will kill the episode with a -0.1 penalty.
 """)
 
@@ -155,7 +143,7 @@ def build_user_message(obs, step_num: int, prev_actions: list) -> str:
     bonus_paid = obs.metadata.get("reasoning_bonus_paid", False) if obs.metadata else False
 
     return textwrap.dedent(f"""\
-Scenario (Level {obs.scenario_level}):
+Scenario (Task {obs.scenario_level}):
 {obs.scenario_description}
 
 Current SQL:
@@ -210,11 +198,6 @@ def format_action_str(action: DbaTunerAction) -> str:
         return f"add_index({action.table},{action.column})"
     if action.action_type == "drop_index":
         return f"drop_index({action.index_name})"
-    if action.action_type == "rewrite":
-        preview = (action.new_sql or "")[:120].replace("\n", " ")
-        return f"rewrite({preview}...)"
-    if action.action_type == "create_materialized_view":
-        return f"create_mv({action.view_name})"
     return f"{action.action_type}()"
 
 
@@ -271,14 +254,14 @@ def run_task(
                     if attempt < max_retries - 1:
                         time.sleep(5)
                     else:
-                        llm_text = '{"action_type": "explain"}'
+                        llm_text = '{"action_type": "done"}'
 
             # Parse action
             try:
                 action = parse_llm_action(llm_text)
             except Exception as e:
                 print(f"  [PARSING ERROR] {e}\n  LLM Text: {llm_text[:150]}...", file=sys.stderr)
-                action = DbaTunerAction(action_type="explain")
+                action = DbaTunerAction(action_type="done")
 
             action_str = format_action_str(action)
             prev_actions.append(action_str)
@@ -308,13 +291,11 @@ def run_task(
 
         # Episode score = final terminal reward (the last reward when done=True)
         score = rewards[-1] if rewards else 0.0
-        avg_r = sum(rewards) / len(rewards) if rewards else 0.0
         success = score > 0.0
 
     except Exception:
         traceback.print_exc(file=sys.stderr)
         score = 0.0
-        avg_r = 0.0
         if not rewards:
             rewards = [0.0]
             steps = 1
@@ -331,7 +312,7 @@ def run_task(
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    """Run inference across all 7 tasks."""
+    """Run inference across all 3 tasks."""
     if not API_KEY:
         print("ERROR: No API key found.", file=sys.stderr)
         print("  Set HF_TOKEN (or API_KEY) in your environment:", file=sys.stderr)

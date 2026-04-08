@@ -6,8 +6,8 @@ app: server.app:app
 port: 8000
 description: >
   DBA-Tuner-Env: An AI agent acts as a Database Administrator optimising
-  DuckDB query performance across 7 difficulty levels — from simple index
-  creation to materialised views and N+1 pattern fixes.
+  DuckDB query performance across 3 difficulty levels — point lookups,
+  join optimisation, and range scans.
   Features a Pareto-skewed (α=1.1) e-commerce dataset, continuous reward
   signal, 50 MB storage budget, and 5-second SQL timeout sandbox.
 tags:

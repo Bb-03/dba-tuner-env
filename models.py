@@ -40,8 +40,8 @@ class DbaTunerReward(BaseModel):
         default=False,
         description=(
             "Whether the task success condition was met "
-            "(cost_reduction_ratio > 0.3). Explain/get_stats bonuses alone "
-            "cannot set this to True."
+            "(meaningful cost reduction achieved). Explain/get_stats bonuses "
+            "alone cannot set this to True."
         ),
     )
     cost_reduction_ratio: float = Field(
@@ -80,12 +80,6 @@ class DbaTunerAction(Action):
                       Earns a one-time +0.1 reasoning bonus (first call per episode).
     * ``add_index`` – CREATE INDEX on *table*.*column* (costs storage budget).
     * ``drop_index``– DROP INDEX by *index_name* (frees budget).
-    * ``rewrite``   – Replace the current SQL with *new_sql*.
-                      Not available on Level 4 (index-budget-only).
-    * ``create_materialized_view`` – For Level 7: create a materialized table
-                      using *view_name* and *sql* fields. The *sql* may be a
-                      bare SELECT (auto-wrapped) or a CREATE TABLE AS SELECT.
-                      Then submit a rewrite() with a SELECT from that table.
     * ``get_stats`` – Retrieve cardinality / distribution stats for *table*.
                       Earns a one-time +0.1 reasoning bonus (first call per episode).
     * ``done``      – Terminate the episode explicitly when you believe the
@@ -109,7 +103,7 @@ class DbaTunerAction(Action):
     """
 
     action_type: Literal[
-        "explain", "add_index", "drop_index", "rewrite", "get_stats", "create_materialized_view", "done"
+        "explain", "add_index", "drop_index", "get_stats", "done"
     ] = Field(..., description="Which action to perform")
 
     # --- add_index / get_stats ---
@@ -124,30 +118,6 @@ class DbaTunerAction(Action):
     # --- drop_index ---
     index_name: Optional[str] = Field(
         default=None, description="Exact index name to drop (drop_index only)"
-    )
-
-    # --- rewrite ---
-    new_sql: Optional[str] = Field(
-        default=None,
-        description=(
-            "Full replacement SQL query (rewrite only). "
-            "May be a SELECT, CTE, window function, or CREATE TABLE AS SELECT. "
-            "Destructive DDL (DELETE, DROP TABLE, TRUNCATE, ALTER TABLE, UPDATE, INSERT) is blocked. "
-            "Not available on Level 4 (index-budget-only task)."
-        ),
-    )
-
-    # --- create_materialized_view ---
-    view_name: Optional[str] = Field(
-        default=None,
-        description="Name of the materialized table to create (e.g. 'top_users_revenue')",
-    )
-    sql: Optional[str] = Field(
-        default=None,
-        description=(
-            "SQL for the materialized view. Can be a bare SELECT (auto-wrapped as "
-            "CREATE TABLE <view_name> AS <sql>) or a full CREATE TABLE AS SELECT."
-        ),
     )
 
 
@@ -169,14 +139,10 @@ class DbaTunerObservation(Observation):
         ★ = Pareto-skewed column: ~20% of values account for ~80% of rows.
             Use get_stats to identify the hot values before indexing.
 
-    7-Level Curriculum:
-        L1 (Easy)   – Sequential scan on high-cardinality non-indexed column.
-        L2 (Medium) – Large table point lookup (missing index on line_items.product_id).
-        L3 (Medium) – Redundant UNION ALL scans → single CASE WHEN GROUP BY.
-        L4 (Hard)   – Budget Challenge: 5 slow queries, 50 MB index limit (index-only, no rewrite).
-        L5 (Hard)   – N+1 query pattern → single batch JOIN.
-        L6 (Hard)   – Range scan optimisation on order_date.
-        L7 (Hard)   – Materialised view for a 5-table aggregation join.
+    3-Task Curriculum:
+        T1 (Easy)   – Point lookup on orders.user_id → add index.
+        T2 (Medium) – Join-heavy query over orders + line_items → add indexes.
+        T3 (Hard)   – Selective date-range query on orders.order_date → add index.
 
     Reward structure:
         Reward = CostReductionRatio - 0.02×indexes - 0.005×storage_mb - 0.005×steps
@@ -241,7 +207,7 @@ class DbaTunerObservation(Observation):
     # ── Scenario metadata ────────────────────────────────────────────────
     scenario_level: int = Field(
         default=1,
-        description="Difficulty level 1–7",
+        description="Task level 1–3",
     )
     scenario_description: str = Field(
         default="",

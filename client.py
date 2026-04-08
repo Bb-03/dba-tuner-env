@@ -43,8 +43,6 @@ class DbaTunerEnv(
             payload["column"] = action.column
         if action.index_name is not None:
             payload["index_name"] = action.index_name
-        if action.new_sql is not None:
-            payload["new_sql"] = action.new_sql
         return payload
 
     def _parse_result(self, payload: Dict[str, Any]) -> StepResult[DbaTunerObservation]:
