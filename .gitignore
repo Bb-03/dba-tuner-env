@@ -10,3 +10,9 @@ __pycache__/
 
 # OpenEnv / Testing cache
 .pytest_cache/
+
+# Python packaging metadata
+*.egg-info/
+
+# OpenEnv
+openenv_dba_tuner_env.egg-info/
