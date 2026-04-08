@@ -190,12 +190,12 @@ class DbaTunerEnvironment(Environment):
         try:
             rows = self._conn.execute(f"EXPLAIN {sql}").fetchall()
             plan_text = "\n".join(str(r).upper() for r in rows)
-            
+
             operator_count = (
-                plan_text.count("_SCAN") + 
-                plan_text.count("_JOIN") + 
-                plan_text.count("GROUP") + 
-                plan_text.count("FILTER") + 
+                plan_text.count("_SCAN") +
+                plan_text.count("_JOIN") +
+                plan_text.count("GROUP") +
+                plan_text.count("FILTER") +
                 plan_text.count("PROJECTION") +
                 plan_text.count("WINDOW")
             )
@@ -243,13 +243,13 @@ class DbaTunerEnvironment(Environment):
         self._gold_sql = self._scenario["gold_sql"]
         self._verification_sql = self._scenario["verification_sql"]
         self._current_sql = self._scenario["initial_sql"]
-        
+
         try:
             _, lat = _execute_with_timeout(self._conn, self._current_sql)
             self._baseline_latency = lat
         except Exception:
             self._baseline_latency = 100.0
-            
+
         self._baseline_plan_cost = float(self._get_plan_complexity(self._current_sql))
 
         return DbaTunerObservation(
@@ -351,7 +351,7 @@ class DbaTunerEnvironment(Environment):
         rows = self._conn.execute(f"EXPLAIN {self._current_sql}").fetchall()
         plan_text = "\n".join(str(r) for r in rows)
         plan_text = _shrink_plan(plan_text)
-        
+
         return self._make_obs(query_plan=plan_text, reward=self._calculate_reward() + bonus)
 
     def _handle_get_stats(self, table: Optional[str]) -> DbaTunerObservation:
@@ -385,35 +385,35 @@ class DbaTunerEnvironment(Environment):
             return self._make_obs(error_message="rewrite requires 'sql' field.", reward=0.0)
 
         is_create = new_sql.strip().upper().startswith("CREATE")
-        
+
         if not is_create:
             try:
                 # 1. Execute both queries
                 new_df = self._conn.execute(new_sql).df()
                 gold_df = self._conn.execute(self._verification_sql).df()
-                
+
                 # 2. Strict Dataset Correctness Check
                 if len(new_df.columns) != len(gold_df.columns) or len(new_df) != len(gold_df):
                     self._done = True
                     self._episode_failed = True
                     return self._make_obs(error_message="Result row/column count mismatch.", is_correct=False, reward=0.0, done=True)
-                
+
                 # 3. Align column order
                 new_df = new_df.reindex(sorted(new_df.columns), axis=1)
                 gold_df = gold_df.reindex(sorted(gold_df.columns), axis=1)
-                
+
                 # 4. Round floats and sort to prevent micro-variance failures
                 for col in gold_df.columns:
-                    if gold_df[col].dtype in ('float64', 'float32'):
+                    if gold_df[col].dtype in ("float64", "float32"):
                         gold_df[col] = gold_df[col].round(4)
                         if col in new_df.columns:
                             new_df[col] = new_df[col].round(4)
-                            
+
                 # Sort rows to ensure order doesn't trigger false failure
                 sort_cols = list(gold_df.columns)
-                new_df = new_df.sort_values(by=list(new_df.columns), na_position='last').reset_index(drop=True)
-                gold_df = gold_df.sort_values(by=sort_cols, na_position='last').reset_index(drop=True)
-                
+                new_df = new_df.sort_values(by=list(new_df.columns), na_position="last").reset_index(drop=True)
+                gold_df = gold_df.sort_values(by=sort_cols, na_position="last").reset_index(drop=True)
+
                 # Compare underlying values to bypass column alias mismatches
                 if not np.array_equal(new_df.values, gold_df.values):
                     self._done = True
@@ -433,7 +433,7 @@ class DbaTunerEnvironment(Environment):
 
         self._current_sql = new_sql
         return self._make_obs(query_plan="Query successfully rewritten.", reward=self._calculate_reward())
-        
+
     def _calculate_reward(self) -> float:
         self._cost_reduction_ratio = 0.0
         try:
@@ -445,21 +445,28 @@ class DbaTunerEnvironment(Environment):
                 ratio = 1.0 - (current_cost / baseline)
         except Exception:
             ratio = 0.0
-            
+
         ratio = max(0.0, min(1.0, ratio))
         self._cost_reduction_ratio = ratio
 
         if ratio > 0.15:
             self._task_solved = True
-        
+
         return ratio - (0.01 * self._state.step_count)
 
     def _compute_terminal_reward(self) -> float:
+        MIN_SCORE = 0.01
+        MAX_SCORE = 0.99
+
         if self._episode_failed:
-            return 0.0
+            return MIN_SCORE
+
         if not self._task_solved:
-            return 0.0
-        return max(0.0, min(1.0, self._cost_reduction_ratio))
+            return MIN_SCORE
+
+        score = self._cost_reduction_ratio
+        score = max(MIN_SCORE, min(MAX_SCORE, score))
+        return score
 
     def _generate_data(self) -> None:
         conn = self._conn
@@ -469,12 +476,20 @@ class DbaTunerEnvironment(Environment):
         num_users = 100_000
         countries = ["US", "UK", "DE", "FR", "JP", "IN", "BR", "CA", "AU", "MX"]
         conn.execute("CREATE TABLE users (user_id INTEGER PRIMARY KEY, username VARCHAR, email VARCHAR, signup_date DATE, country VARCHAR)")
-        conn.execute(f"INSERT INTO users SELECT i, 'user_'||i, 'user_'||i||'@example.com', DATE '2020-01-01' + INTERVAL (i % 1095) DAY, CASE (i % {len(countries)}) " + " ".join(f"WHEN {j} THEN '{c}'" for j, c in enumerate(countries)) + f" END FROM generate_series(1, {num_users}) t(i)")
+        conn.execute(
+            f"INSERT INTO users SELECT i, 'user_'||i, 'user_'||i||'@example.com', DATE '2020-01-01' + INTERVAL (i % 1095) DAY, CASE (i % {len(countries)}) "
+            + " ".join(f"WHEN {j} THEN '{c}'" for j, c in enumerate(countries))
+            + f" END FROM generate_series(1, {num_users}) t(i)"
+        )
 
         num_products = 10_000
         categories = ["Electronics", "Clothing", "Books", "Home", "Sports"]
         conn.execute("CREATE TABLE products (product_id INTEGER PRIMARY KEY, name VARCHAR, category VARCHAR, price DOUBLE, created_at DATE)")
-        conn.execute(f"INSERT INTO products SELECT i, 'product_'||i, CASE (i % {len(categories)}) " + " ".join(f"WHEN {j} THEN '{c}'" for j, c in enumerate(categories)) + f" END, ROUND(5.0 + (i % 500) * 0.5, 2), DATE '2020-01-01' + INTERVAL (i % 730) DAY FROM generate_series(1, {num_products}) t(i)")
+        conn.execute(
+            f"INSERT INTO products SELECT i, 'product_'||i, CASE (i % {len(categories)}) "
+            + " ".join(f"WHEN {j} THEN '{c}'" for j, c in enumerate(categories))
+            + f" END, ROUND(5.0 + (i % 500) * 0.5, 2), DATE '2020-01-01' + INTERVAL (i % 730) DAY FROM generate_series(1, {num_products}) t(i)"
+        )
 
         num_orders = 100_000
         statuses = ["pending", "completed", "cancelled", "shipped", "returned"]
@@ -488,7 +503,10 @@ class DbaTunerEnvironment(Environment):
         conn.execute("CREATE TEMPORARY TABLE _tmp_orders (oid INTEGER, uid INTEGER, day_offset INTEGER, status VARCHAR, amount DOUBLE)")
         for start in range(0, num_orders, 10_000):
             end = min(start + 10_000, num_orders)
-            vals = ", ".join(f"({i+1}, {int(user_ids[i])}, {int(order_day_offsets[i])}, '{statuses[int(order_status_idx[i])]}', {float(order_amounts[i])})" for i in range(start, end))
+            vals = ", ".join(
+                f"({i+1}, {int(user_ids[i])}, {int(order_day_offsets[i])}, '{statuses[int(order_status_idx[i])]}', {float(order_amounts[i])})"
+                for i in range(start, end)
+            )
             conn.execute(f"INSERT INTO _tmp_orders SELECT * FROM (VALUES {vals})")
         conn.execute("INSERT INTO orders SELECT oid, uid, DATE '2023-01-01' + INTERVAL (day_offset) DAY, status, amount FROM _tmp_orders")
         conn.execute("DROP TABLE _tmp_orders")
@@ -504,7 +522,10 @@ class DbaTunerEnvironment(Environment):
         conn.execute("CREATE TEMPORARY TABLE _tmp_li (lid INTEGER, oid INTEGER, pid INTEGER, qty INTEGER, price DOUBLE)")
         for start in range(0, num_line_items, 10_000):
             end = min(start + 10_000, num_line_items)
-            vals = ", ".join(f"({i+1}, {int(li_order_ids[i])}, {int(product_ids[i])}, {int(li_quantities[i])}, {float(li_unit_prices[i])})" for i in range(start, end))
+            vals = ", ".join(
+                f"({i+1}, {int(li_order_ids[i])}, {int(product_ids[i])}, {int(li_quantities[i])}, {float(li_unit_prices[i])})"
+                for i in range(start, end)
+            )
             conn.execute(f"INSERT INTO _tmp_li SELECT * FROM (VALUES {vals})")
         conn.execute("INSERT INTO line_items SELECT lid, oid, pid, qty, price FROM _tmp_li")
         conn.execute("DROP TABLE _tmp_li")
@@ -521,12 +542,15 @@ class DbaTunerEnvironment(Environment):
             done = self._done
 
         if done:
+            MIN_SCORE = 0.01
+            MAX_SCORE = 0.99
+
             if not is_correct or self._episode_failed:
-                reward = 0.0
+                reward = MIN_SCORE
             elif self._task_solved:
-                reward = max(0.0, min(1.0, reward))
+                reward = max(MIN_SCORE, min(MAX_SCORE, reward))
             else:
-                reward = 0.0
+                reward = MIN_SCORE
 
         latency_ms = 0.0
         total_cost = 0.0
@@ -583,15 +607,14 @@ if __name__ == "__main__":
     env = DbaTunerEnvironment()
     obs = env.reset(seed=42, level=1)
     print(f"Level {obs.scenario_level}: {obs.scenario_description[:80]}…")
-    
+
     obs = env.step(DbaTunerAction(action_type="explain"))
     print(f"[explain] reward={obs.reward:.4f} cost={obs.total_cost}")
-    
-    # Task 1 Rewrite
+
     rewrite_sql = "SELECT CASE WHEN total_amount > 500 THEN 'high' WHEN total_amount >= 100 THEN 'medium' ELSE 'low' END AS segment, COUNT(*) AS cnt FROM orders GROUP BY segment"
     obs = env.step(DbaTunerAction(action_type="rewrite", sql=rewrite_sql))
     print(f"[rewrite] reward={obs.reward:.4f} cost={obs.total_cost} ratio={obs.metadata['cost_reduction_ratio']}")
-    
+
     obs = env.step(DbaTunerAction(action_type="done"))
     print(f"[done] final_score={obs.reward:.4f}")
     env.close()
