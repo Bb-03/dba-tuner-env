@@ -1,7 +1,0 @@
-openenv-core[cli,core]>=0.2.2
-duckdb>=1.0.0
-numpy>=1.24.0
-
-[dev]
-pytest>=8.0.0
-pytest-cov>=4.0.0
