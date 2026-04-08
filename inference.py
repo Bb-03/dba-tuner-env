@@ -1,8 +1,7 @@
 """
 DBA Tuner Env - Inference Script
 ===================================
-Demonstrates a full "Thinking Trajectory" across all 3 tasks:
-    explain → get_stats → add_index → done
+Demonstrates a full trajectory across all 3 analytical rewrite tasks.
 
 MANDATORY environment variables:
     HF_TOKEN        Your Hugging Face API key (or any OpenAI-compatible key).
@@ -51,9 +50,9 @@ MAX_STEPS    = 15  # covers all 3 tasks
 
 # All 3 tasks (easy → hard)
 TASKS = [
-    {"name": "simple_index",      "level": 1, "difficulty": "easy"},
-    {"name": "join_optimization", "level": 2, "difficulty": "medium"},
-    {"name": "range_scan",        "level": 3, "difficulty": "hard"},
+    {"name": "union_consolidation", "level": 1, "difficulty": "easy"},
+    {"name": "subquery_decorrelation", "level": 2, "difficulty": "medium"},
+    {"name": "materialized_view",   "level": 3, "difficulty": "hard"},
 ]
 
 # ── Full database schema (injected into every LLM prompt) ─────────────────────
@@ -68,23 +67,20 @@ DATABASE_SCHEMA = textwrap.dedent("""\
     │   product_id INTEGER PK, name VARCHAR, category VARCHAR,               │
     │   price DOUBLE, created_at DATE                                         │
     ├─────────────────────────────────────────────────────────────────────────┤
-    │ orders     (100 000 rows)  ★ Pareto-skewed on user_id (α=1.1)          │
+    │ orders     (100 000 rows)                                              │
     │   order_id INTEGER PK, user_id INTEGER, order_date DATE,               │
     │   status VARCHAR, total_amount DOUBLE                                   │
     ├─────────────────────────────────────────────────────────────────────────┤
-    │ line_items (300 000 rows)  ★ Pareto-skewed on product_id (α=1.1)       │
+    │ line_items (300 000 rows)                                              │
     │   line_item_id INTEGER PK, order_id INTEGER, product_id INTEGER,       │
     │   quantity INTEGER, unit_price DOUBLE                                   │
     └─────────────────────────────────────────────────────────────────────────┘
-    ★ Pareto skew: ~20% of user/product IDs account for ~80% of rows.
-      Use get_stats to identify hot columns before indexing.
-      Index budget: 50 MB total. Each index on orders/line_items ≈ 0.76 MB.
 """)
 
 # ── System Prompt ──────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = textwrap.dedent(f"""\
 You are an expert Database Administrator (DBA) optimising a DuckDB database for performance.
-Your goal is to reduce query cost by adding targeted indexes.
+Your goal is to rewrite complex and inefficient SQL queries to massively reduce the physical execution tree complexity.
 
 {DATABASE_SCHEMA}
 
@@ -93,37 +89,31 @@ AVAILABLE ACTIONS (respond with ONLY a valid JSON object — no markdown, no exp
 1. Examine the query execution plan (earns a ONE-TIME +0.1 reasoning bonus on first call):
    {{"action_type": "explain"}}
 
-2. Get full column stats including estimated index sizes (earns the same one-time +0.1 bonus):
+2. Get full column stats (earns the same one-time +0.1 bonus):
    {{"action_type": "get_stats", "table": "TABLE_NAME"}}
    Valid tables: users, products, orders, line_items
 
-3. Add an index on a column (costs storage budget ≈ 0.76 MB each):
-   {{"action_type": "add_index", "table": "TABLE_NAME", "column": "COLUMN_NAME"}}
+3. Submit a rewritten SQL query to test its execution complexity:
+   {{"action_type": "rewrite", "sql": "YOUR_NEW_SQL_HERE"}}
 
-4. Drop an existing index (reclaims storage):
-   {{"action_type": "drop_index", "index_name": "INDEX_NAME"}}
-
-5. Signal that the task is solved (terminates the episode):
+4. Signal that the task is solved (terminates the episode):
    {{"action_type": "done"}}
 
 REWARD SIGNAL:
-  +CostReductionRatio   Proportional to EXPLAIN plan cost reduction (0.0 -> 1.0).
+  +CostReductionRatio   Proportional to reduction in node counts of the physical execution tree (EXPLAIN).
   +0.1                  One-time bonus for your FIRST explain or get_stats call.
-  -0.02 x indexes       Penalty per index created (over-indexing is penalised).
-  -0.005 x MB_used      Penalty per MB of index storage.
-  -0.005 x step         Efficiency penalty per step -- solve it quickly!
+  -0.01 x step          Efficiency penalty per step -- solve it quickly!
   Terminal score        Clamped to [0.0, 1.0] when done=true.
-  IMPORTANT: You must achieve real cost reduction (>30%) for a non-zero terminal score.
-             Explain/get_stats bonuses alone will NOT earn a passing score.
+  IMPORTANT: You must achieve meaningful complexity reduction (>15%) for a non-zero terminal score.
 
-OPTIMAL STRATEGY:
-  1. ALWAYS start with explain (earns reasoning bonus + reveals scan type).
-  2. Use get_stats on the WHERE / JOIN columns to confirm selectivity.
-  3. Add at most 1-2 targeted indexes — more is penalised.
-  4. Call done when cost reduction is high to lock in the terminal reward.
+CRITICAL GUIDELINES:
+1. DO NOT panick if you receive an error message. Simply correct your SQL and try again.
+2. If a table 'already exists' in Task 3, proceed to your final SELECT action immediately.
+3. ALWAYS preserve filters (like 'status = completed') from the initial SQL to ensure correctness.
+4. Respond ONLY with JSON. Never explain your thoughts in plain text.
 
 IMPORTANT: Respond with exactly ONE valid JSON action object in your reply. Do NOT output any other text or markdown code blocks.
-DANGER: Do NOT repeat any action (like explain or get_stats) twice in a row with identical parameters. Each step costs efficiency bonus, and IDENTICAL CONSECUTIVE actions will kill the episode with a -0.1 penalty.
+DANGER: Do NOT repeat any action (like explain) twice in a row with identical parameters. IDENTICAL CONSECUTIVE actions will kill the episode with a -0.1 penalty.
 """)
 
 
@@ -151,9 +141,7 @@ Current SQL:
 
 Performance Metrics:
   Latency        : {obs.latency_ms:.2f} ms
-  Cost-Reduction : {cost_ratio:.2%}
-  Storage used   : {obs.storage_used_mb:.2f} MB  /  remaining: {obs.storage_remaining_mb:.2f} MB
-  Active indexes : {obs.active_indexes if obs.active_indexes else 'none'}
+  Cost-Reduction : {cost_ratio:.2%} (Execution Tree Complexity Reduction)
   Reasoning bonus: {'already earned — no more bonus for explain/get_stats' if bonus_paid else 'NOT YET EARNED — call explain or get_stats to earn +0.1'}
 
 Query Plan / Info:
@@ -163,7 +151,7 @@ Error: {obs.error_message if obs.error_message else 'none'}
 {history}
 
 Step {step_num} of {MAX_STEPS}. 
-HINT: If you have already achieved a high Cost-Reduction (>50%) and cannot find further improvements, call {{"action_type": "done"}} to finalize your score and earn the maximum terminal reward.
+HINT: If you have already achieved a high Cost-Reduction (>30%) and cannot find further structural improvements, call {{"action_type": "done"}} to finalize your score and earn the maximum terminal reward.
 
 Respond with your next action as JSON:\
 """)
@@ -194,10 +182,8 @@ def format_action_str(action: DbaTunerAction) -> str:
         return "explain()"
     if action.action_type == "get_stats":
         return f"get_stats({action.table})"
-    if action.action_type == "add_index":
-        return f"add_index({action.table},{action.column})"
-    if action.action_type == "drop_index":
-        return f"drop_index({action.index_name})"
+    if action.action_type == "rewrite":
+        return "rewrite(...)"
     return f"{action.action_type}()"
 
 

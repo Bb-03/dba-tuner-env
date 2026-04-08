@@ -39,10 +39,8 @@ class DbaTunerEnv(
         }
         if action.table is not None:
             payload["table"] = action.table
-        if action.column is not None:
-            payload["column"] = action.column
-        if action.index_name is not None:
-            payload["index_name"] = action.index_name
+        if action.sql is not None:
+            payload["sql"] = action.sql
         return payload
 
     def _parse_result(self, payload: Dict[str, Any]) -> StepResult[DbaTunerObservation]:
@@ -52,10 +50,6 @@ class DbaTunerEnv(
             query_plan=obs_data.get("query_plan", ""),
             latency_ms=obs_data.get("latency_ms", 0.0),
             total_cost=obs_data.get("total_cost", 0.0),
-            storage_used_mb=obs_data.get("storage_used_mb", 0.0),
-            storage_remaining_mb=obs_data.get("storage_remaining_mb", 50.0),
-            index_count=obs_data.get("index_count", 0),
-            active_indexes=obs_data.get("active_indexes", []),
             is_correct=obs_data.get("is_correct", True),
             current_sql=obs_data.get("current_sql", ""),
             scenario_level=obs_data.get("scenario_level", 1),

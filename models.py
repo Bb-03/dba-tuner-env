@@ -40,25 +40,17 @@ class DbaTunerReward(BaseModel):
         default=False,
         description=(
             "Whether the task success condition was met "
-            "(meaningful cost reduction achieved). Explain/get_stats bonuses "
+            "(meaningful complexity reduction achieved). Explain/get_stats bonuses "
             "alone cannot set this to True."
         ),
     )
     cost_reduction_ratio: float = Field(
         default=0.0,
-        description="(baseline_plan_cost - current_plan_cost) / baseline_plan_cost",
-    )
-    index_penalty: float = Field(
-        default=0.0,
-        description="-0.02 × index_count",
-    )
-    storage_penalty: float = Field(
-        default=0.0,
-        description="-0.005 × storage_used_mb",
+        description="(baseline_plan_complexity - current_plan_complexity) / baseline_plan_complexity",
     )
     step_penalty: float = Field(
         default=0.0,
-        description="-0.005 × step_count",
+        description="-0.01 * step_count",
     )
     reasoning_bonus: float = Field(
         default=0.0,
@@ -76,48 +68,28 @@ class DbaTunerAction(Action):
 
     The *action_type* field selects which operation to perform:
 
-    * ``explain``   – Run EXPLAIN ANALYZE on the current query.
-                      Earns a one-time +0.1 reasoning bonus (first call per episode).
-    * ``add_index`` – CREATE INDEX on *table*.*column* (costs storage budget).
-    * ``drop_index``– DROP INDEX by *index_name* (frees budget).
+    * ``explain``   – Run EXPLAIN on the current query.
+                      Earns a one-time +0.1 reasoning bonus.
     * ``get_stats`` – Retrieve cardinality / distribution stats for *table*.
-                      Earns a one-time +0.1 reasoning bonus (first call per episode).
-    * ``done``      – Terminate the episode explicitly when you believe the
-                      task is fully solved.
-
-    Reward Signal:
-        +CostReductionRatio      Proportional to (baseline_cost − current_cost) / baseline_cost.
-                                 Based on EXPLAIN plan estimated rows (deterministic).
-        +0.1                     One-time bonus for the first explain or get_stats call.
-        −0.02 × index_count      Penalty per index created (over-indexing discouraged).
-        −0.005 × storage_mb      Penalty per MB of index storage consumed.
-        −0.005 × step_count      Efficiency penalty for each step taken.
-
-        Final episode score (done=True, task_solved=True): clamped to [0.0, 1.0].
-        Final episode score (done=True, task_solved=False): forced to 0.0.
-        Intra-episode step rewards may be negative (RL signal).
-
-    Task Solved Condition:
-        cost_reduction_ratio > 0.3 (meaningful optimisation achieved).
-        Explain/get_stats bonuses alone cannot satisfy this condition.
+                      Earns a one-time +0.1 reasoning bonus.
+    * ``rewrite``   – Submit a rewritten SQL query to replace the current one.
+    * ``done``      – Terminate the episode explicitly.
     """
 
     action_type: Literal[
-        "explain", "add_index", "drop_index", "get_stats", "done"
+        "explain", "get_stats", "rewrite", "done"
     ] = Field(..., description="Which action to perform")
 
-    # --- add_index / get_stats ---
+    # --- get_stats ---
     table: Optional[str] = Field(
         default=None,
         description="Target table name. Valid: users, products, orders, line_items",
     )
-    column: Optional[str] = Field(
-        default=None, description="Target column name (add_index only)"
-    )
 
-    # --- drop_index ---
-    index_name: Optional[str] = Field(
-        default=None, description="Exact index name to drop (drop_index only)"
+    # --- rewrite ---
+    sql: Optional[str] = Field(
+        default=None,
+        description="The rewritten SQL query to test against the environment.",
     )
 
 
@@ -133,30 +105,21 @@ class DbaTunerObservation(Observation):
 
         users      (100 000 rows)  user_id, username, email, signup_date, country
         products   (  10 000 rows) product_id, name, category, price, created_at
-        orders     (100 000 rows)  order_id, user_id★, order_date, status, total_amount
-        line_items (300 000 rows)  line_item_id, order_id, product_id★, quantity, unit_price
-
-        ★ = Pareto-skewed column: ~20% of values account for ~80% of rows.
-            Use get_stats to identify the hot values before indexing.
-
-    3-Task Curriculum:
-        T1 (Easy)   – Point lookup on orders.user_id → add index.
-        T2 (Medium) – Join-heavy query over orders + line_items → add indexes.
-        T3 (Hard)   – Selective date-range query on orders.order_date → add index.
+        orders     (100 000 rows)  order_id, user_id, order_date, status, total_amount
+        line_items (300 000 rows)  line_item_id, order_id, product_id, quantity, unit_price
 
     Reward structure:
-        Reward = CostReductionRatio - 0.02×indexes - 0.005×storage_mb - 0.005×steps
-        Cost is measured via EXPLAIN plan estimated rows (deterministic, no timing).
+        Reward = CostReductionRatio - 0.01 * step_count
+        Cost is measured via 0-compute tree node counting.
         Step rewards are raw (may be negative — this is intentional RL signal).
         Terminal reward (done=True, task_solved=True) is clamped to [0.0, 1.0].
-        Terminal reward (done=True, task_solved=False) is forced to 0.0.
-        task_solved requires cost_reduction_ratio > 0.3 (explain/get_stats alone insufficient).
+        task_solved requires cost_reduction_ratio > 0.3.
     """
 
     # ── Query plan / stats output ────────────────────────────────────────
     query_plan: str = Field(
         default="",
-        description="EXPLAIN ANALYZE output or get_stats text",
+        description="EXPLAIN output or get_stats text",
     )
 
     # ── Performance metrics ──────────────────────────────────────────────
@@ -166,27 +129,7 @@ class DbaTunerObservation(Observation):
     )
     total_cost: float = Field(
         default=0.0,
-        description="Deterministic plan cost (estimated rows from EXPLAIN)",
-    )
-
-    # ── Storage budget ───────────────────────────────────────────────────
-    storage_used_mb: float = Field(
-        default=0.0,
-        description="Total index storage consumed this episode (MB)",
-    )
-    storage_remaining_mb: float = Field(
-        default=50.0,
-        description="Remaining index storage budget (MB)",
-    )
-
-    # ── Index tracking ───────────────────────────────────────────────────
-    index_count: int = Field(
-        default=0,
-        description="Number of agent-created indexes currently active",
-    )
-    active_indexes: List[str] = Field(
-        default_factory=list,
-        description="List of active index names with their estimated sizes (e.g. 'idx_orders_user_id: 0.76MB')",
+        description="Deterministic plan cost (execution tree node count)",
     )
 
     # ── Correctness ──────────────────────────────────────────────────────
@@ -213,7 +156,7 @@ class DbaTunerObservation(Observation):
         default="",
         description=(
             "Human-readable task description including schema hints, "
-            "available index budget, and optimisation goal."
+            "and optimisation goal."
         ),
     )
 
@@ -227,8 +170,7 @@ class DbaTunerObservation(Observation):
     done: bool = Field(
         default=False,
         description=(
-            "True when the episode has ended (max steps, correctness failure, "
-            "or early success via CostReductionRatio > 0.95)."
+            "True when the episode has ended (max steps, correctness failure)."
         ),
     )
     reward: float = Field(
@@ -236,7 +178,6 @@ class DbaTunerObservation(Observation):
         description=(
             "Step reward. Intra-episode values may be negative (efficiency/penalty signal). "
             "Terminal reward (done=True, task_solved=True) is clamped to [0.0, 1.0]. "
-            "Terminal reward (done=True, task_solved=False) is always 0.0."
         ),
     )
 
