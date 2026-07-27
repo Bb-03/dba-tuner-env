@@ -272,3 +272,5 @@ dba-tuner-env/
 - [OpenEnv Documentation](https://github.com/meta-pytorch/OpenEnv)
 - [DuckDB EXPLAIN Reference](https://duckdb.org/docs/guides/meta/explain.html)
 - [OpenEnv Environment Design Guide](https://github.com/meta-pytorch/OpenEnv/blob/main/README.md)
+
+Contributors- Akshara Gupta & Bhavya Jain
